@@ -617,6 +617,8 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
         ("a secret line with a NUL in it", [secret_line + b"\x00 junk", settings], "secret"),
         ("a secret with a \\u0000 in it",
          [b'{"line": 1, "secret": "' + b"11" * 32 + b'\\u0000"}', settings], "secret"),
+        ("a secret line with a key and no value",
+         [b'{"line": 1, "secret": "' + b"11" * 32 + b'", "secret":}', settings], "secret"),
         ("settings that listen beyond 127.0.0.1",
          [secret_line, json.dumps({**SETTINGS, "listen": "0.0.0.0:5060"}).encode()], "settings"),
         ("an account that isn't on 127.0.0.1",
@@ -667,6 +669,11 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
          b'{"id": 1, "do": "hangup", "call": "0123456789abcdef"} {"id": 2, "do": "quit"}'),
         ("a command with a NUL in it", b'{"id": 1, "do": "quit"}\x00 junk'),
         ("a command with a \\u0000 in it", b'{"id": 1, "do": "quit\\u0000x"}'),
+        ("a command with a key and no value", b'{"id": 1, "do": "quit", "do":}'),
+        ("a command with a name alone", b'{"id": 1, "do": "quit", "x"}'),
+        ("a command with a trailing comma", b'{"id": 1, "do": "quit",}'),
+        ("a key with a lone surrogate", b'{"id": 1, "do\\udc00": "quit"}'),
+        ("an id past 2^53 - 1", b'{"id": 9007199254740992, "do": "quit"}'),
         ("a line past 4,096 bytes", b"x" * 5000),
     ]
     for n, (what, data) in enumerate(broken):
@@ -691,6 +698,27 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
         check(len(line.raw) == 2 and line.raw[0].startswith(b'{"event":"hello"')
               and line.raw[1].startswith(b'{"event":"reply","id":1,"ok":true'),
               f"  hello first, then the quit's reply ({line.raw})")
+        code = line.exit_code()
+        check(code == 0, f"  and it exits 0 ({code})")
+    finally:
+        line.stop()
+
+    # An address the line doesn't take is a reply, not a broken line: no URI parameters, and no
+    # URI headers (baresip would send ?Replaces= as a Replaces header)
+    line = Line(line_exe, root / "addresses")
+    try:
+        hello_of(line)
+        for to in ("sip:x@127.0.0.1;transport=udp", "sip:x@127.0.0.1?Replaces=abc",
+                   "sip:x y@127.0.0.1", "tel:+15550100"):
+            reply = line.send(do="dial", to=to)
+            check(reply.get("event") == "reply" and reply.get("ok") is False
+                  and reply.get("why") == "an address the line doesn't take",
+                  f"a dial to {to}: refused in its reply ({reply})")
+        line.ids = 9007199254740990       # the next command's id is the largest one taken
+        reply = line.send(do="quit")
+        check(reply.get("event") == "reply" and reply.get("ok") is True
+              and reply.get("id") == 9007199254740991,
+              f"  the line goes on, and the id 2^53 - 1 comes back exact ({reply})")
         code = line.exit_code()
         check(code == 0, f"  and it exits 0 ({code})")
     finally:

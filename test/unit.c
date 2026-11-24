@@ -963,8 +963,9 @@ static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_f
 	consort_id(want, c.nonce, c.port, "line");
 	CHECK(memcmp(back, want, sizeof(want)) == 0);
 
-	/* Nothing is read from here: the 2 s count once both sockets are full. With Windows' own
-	 * buffer sizes they would take every frame for longer than this waits */
+	/* Nothing is read from here: the 2 s count once both sockets are full, whatever share
+	 * Windows gives them. This checks the 2 s, not the line's 2 KB send buffer: without it,
+	 * Windows 11's sockets take about 222 frames, and the call still ends inside these bounds */
 	start = GetTickCount();
 	ended = WaitForSingleObject(c.ending.ev, 12000) == WAIT_OBJECT_0;
 	spent = GetTickCount() - start;
@@ -993,22 +994,57 @@ static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_f
 
 
 /**
+ * Consort speaking while it is behind in reading: a frame of its audio each 20 ms or more,
+ * until told to stop. Told to break a rule, it sends a DTMF frame first (a type Consort
+ * doesn't send, with a payload the line leaves unread), then goes on speaking.
+ */
+struct talker {
+	SOCKET s;
+	volatile LONG stop;
+	volatile LONG breaks;
+};
+
+static DWORD WINAPI talk(LPVOID arg)
+{
+	struct talker *t = arg;
+	uint8_t payload[CL_AUDIO_BYTES];
+	const uint8_t key = '5';
+
+	audio_of(payload, 7);
+	while (!t->stop) {
+		if (InterlockedExchange(&t->breaks, 0) == 1 && !send_frame(t->s, CL_DTMF, &key, 1))
+			break;
+		if (!send_frame(t->s, CL_AUDIO, payload, CL_AUDIO_BYTES))
+			break;
+		Sleep(20);
+	}
+
+	return 0;
+}
+
+
+/**
  * The call ends while Consort is behind in reading: the far end hangs up, or Consort breaks a
  * rule. Every frame that waited for Consort still comes, in order, then HANGUP or ERROR 2,
- * then the close. Consort reads nothing for 1.5 s (a 4 KB receive buffer), past what the two
- * sockets take on Windows 11 (26 frames) and inside the 2 s the line gives Consort once they
- * are full, however soon that is. The stand-in player numbers its frames 1, 2, 3, so a frame
- * missing shows.
+ * then the end, never a reset: also when Consort keeps speaking, and when the frame that
+ * broke the rule has a payload the line never reads (a socket closed with bytes unread, or
+ * that bytes reach once it is closed, resets on Windows). Consort reads nothing for 1.5 s (a
+ * 4 KB receive buffer), past what the two sockets take on Windows 11 (26 frames) and inside
+ * the 2 s the line gives Consort once they are full, however soon that is. The stand-in
+ * player numbers its frames 1, 2, 3, so a frame missing shows.
  */
-static void ends_while_consort_is_behind(bool far_end)
+static void ends_while_consort_is_behind(bool far_end, bool talking)
 {
 	const char *how = far_end ? "the far end hangs up" : "a rule broken";
 	struct call c;
+	struct talker t;
 	uint8_t id[CL_ID_FRAME_BYTES], back[CL_ID_FRAME_BYTES], want[CL_ID_FRAME_BYTES];
 	uint8_t payload[CL_AUDIO_BYTES], type, last = 0, code = 0;
+	const uint8_t key = '5';
 	uint16_t len;
 	unsigned audio = 0, gaps = 0;
 	int16_t v, prev = 0, pulled;
+	HANDLE th = NULL;
 	int r;
 	SOCKET s;
 
@@ -1022,11 +1058,20 @@ static void ends_while_consort_is_behind(bool far_end)
 	consort_id(want, c.nonce, c.port, "line");
 	CHECK(memcmp(back, want, sizeof(want)) == 0);
 
+	memset(&t, 0, sizeof(t));
+	t.s = s;
+	if (talking) {
+		th = CreateThread(NULL, 0, talk, &t, 0, NULL);
+		CHECK(th != NULL);
+	}
+
 	Sleep(1500);
 	if (far_end)
 		cl_link_hangup(c.link);
+	else if (th)
+		InterlockedExchange(&t.breaks, 1);
 	else
-		CHECK(send_frame(s, 0x12, NULL, 0));   /* a type Consort doesn't send */
+		CHECK(send_frame(s, CL_DTMF, &key, 1));
 
 	while ((r = read_frame(s, &type, payload, &len)) == 1) {
 		last = type;
@@ -1042,17 +1087,23 @@ static void ends_while_consort_is_behind(bool far_end)
 		++audio;
 	}
 
+	if (th) {
+		InterlockedExchange(&t.stop, 1);
+		CHECK(WaitForSingleObject(th, 3000) == WAIT_OBJECT_0);
+		CloseHandle(th);
+	}
+
 	AcquireSRWLockExclusive(&c.audio.lock);
 	pulled = c.audio.pulled;
 	ReleaseSRWLockExclusive(&c.audio.lock);
 
-	CHECK(r == 0);                        /* the line closed: not a timeout */
+	CHECK(r == 0);                        /* the line's end came: not a reset, nor a timeout */
 	CHECK(last == (far_end ? CL_HANGUP : CL_ERROR));
 	CHECK(far_end || code == CL_ERR_FRAME);
 	CHECK(gaps == 0 && audio >= 50);      /* about 75: 1.5 s of frames */
 	CHECK(prev == pulled);                /* the last frame the line pulled came too */
-	printf("  %s with Consort behind: %u frames, then 0x%02x and the close\n",
-	       how, audio, last);
+	printf("  %s with Consort behind%s: %u frames, then 0x%02x and the end (%d)\n",
+	       how, talking ? " and speaking" : "", audio, last, r);
 
 	closesocket(s);
 	call_end(&c);
@@ -1061,8 +1112,10 @@ static void ends_while_consort_is_behind(bool far_end)
 
 static void test_the_last_frames_reach_a_consort_that_is_behind(void)
 {
-	ends_while_consort_is_behind(true);
-	ends_while_consort_is_behind(false);
+	ends_while_consort_is_behind(true, false);
+	ends_while_consort_is_behind(false, false);
+	ends_while_consort_is_behind(true, true);
+	ends_while_consort_is_behind(false, true);
 }
 
 

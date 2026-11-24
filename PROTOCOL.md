@@ -19,10 +19,12 @@ writes. Nothing else ever appears on standard output: baresip's log goes to stan
    `{"line": 1, "secret": "<64 hex>"}`
 2. The settings: `{"listen": "127.0.0.1:<port>", "account": "sip:<user>@127.0.0.1", "calls": <1 to 16>}`.
    `listen` is where SIP listens (port 0 lets Windows pick one), `account` is the line's one
-   account, and `calls` is how many calls it takes at once.
+   account (`<user>` letters, digits, `.`, `_` and `-`; the whole account 64 bytes at most),
+   and `calls` is how many calls it takes at once.
 
 Both must have come within 10 seconds of the start. Each is one JSON object with exactly these
-keys, each once, and nothing after it. Otherwise consort-line writes
+keys, each once, and nothing after it, in the form the commands below take. Otherwise
+consort-line writes
 `{"event":"failed","why":"secret"}` (or `"settings"`) and exits with 2. The secret never
 travels anywhere else: never a file, an argument or an environment variable.
 
@@ -35,8 +37,8 @@ travels anywhere else: never a file, an argument or an environment variable.
 | `ringing`, `progress` | a call placed hears 180 or 183 (early media); any number of times | `call` |
 | `answered` | the call is answered: its listener is bound | `call`, `port`, `nonce` (32 hex) |
 | `closed` | the call is over | `call`, `why`, `figures` (the link's counts) |
-| `reply` | a command's answer | `id`, `ok`, then `call` or `why` |
-| `failed` | the channel broke a rule; consort-line exits | `why` |
+| `reply` | a command's answer | `id`, `ok`; `why` when not ok; `call` when the command found or placed a call |
+| `failed` | the channel broke a rule, or the line couldn't start (`why`: "the line couldn't start"); consort-line exits | `why` |
 
 `call` is consort-line's own id for a call, 16 lowercase hex digits. It is never baresip's call
 id, which for an incoming call is the caller's own SIP Call-ID. Text from the far end (`from`,
@@ -44,17 +46,25 @@ id, which for an incoming call is the caller's own SIP Call-ID. Text from the fa
 
 ### Commands (to consort-line)
 
-Each is one JSON object on its line, with an `id` (a whole number from 1, echoed in its
-`reply`) and its other keys, each once, and nothing beyond them:
+Each is one JSON object on its line, with an `id` (a whole number from 1 to 2^53 - 1, that is
+9,007,199,254,740,991, echoed in its `reply`) and its other keys, each once, and nothing
+beyond them:
 
-- `{"id": 1, "do": "dial", "to": "sip:..."}` places a call from the line's account.
+- `{"id": 1, "do": "dial", "to": "sip:..."}` places a call from the line's account. `to` is
+  `sip:` and then printable ASCII, with no spaces and none of `<`, `>`, `"`, `;` or `?` (so no
+  URI parameters or headers: baresip would send a `?Replaces=` as a Replaces header), 512
+  bytes at most. Any other `to` is refused in the reply (`why`: "an address the line doesn't
+  take"), and the line goes on.
 - `{"id": 2, "do": "accept", "call": "<id>"}` answers a call that rang.
 - `{"id": 3, "do": "hangup", "call": "<id>"}`
 - `{"id": 4, "do": "quit"}` hangs up every call and exits.
 
-A line that isn't one of these forms (a key twice, or anything after the object, counts as
-not) writes `failed`, hangs up every call and exits with 1. Standard input closing hangs up
-every call and exits with 0.
+A line that isn't one of these forms writes `failed`, hangs up every call and exits with 1.
+Each member must be a name, a colon and a value (a string, or a word such as a number), with
+no value an object or an array. So these count as not: a key twice, anything after the
+object, a name with no value, an empty member or a trailing comma, and an escaped NUL or
+surrogate (`\u0000`, `\ud800` to `\udfff`). Standard input closing hangs up every call and
+exits with 0.
 
 ### Exit codes
 
@@ -106,7 +116,7 @@ In AudioSocket's form: one byte of type, two bytes of length (big-endian), then 
 | 0x20 | FLUSH | the agent's program | none |
 | 0x21 | FLUSHED | consort-line | 8 bytes: the last MARK played (u32, big-endian; 0 for none), then the samples played since it (u32, big-endian) |
 | 0x22 | MARK | either | 4 bytes: an id (u32, big-endian, from 1) |
-| 0xFF | ERROR | consort-line | 1 byte: 1 the far end hung up, 2 a frame it couldn't forward, 4 out of memory |
+| 0xFF | ERROR | consort-line | 1 byte: 2 a frame it couldn't forward, 4 out of memory (AudioSocket's 1, the far end hung up, never comes: that is HANGUP) |
 
 AUDIO is 20 ms both ways, whatever packet time (`a=ptime`) the far end asks for: baresip
 sends it packets of that length.
@@ -132,8 +142,17 @@ consort-line, once the agent's program has proved itself:
 A frame from the agent's program of a type it doesn't send (ID again, DTMF, FLUSHED, ERROR,
 0x12 or any other), a payload not its type's size (judged from the first three bytes), a MARK
 that isn't the next id, a 65th MARK waiting, or AUDIO that finds the buffer full: consort-line
-sends ERROR 2 (after every frame still waiting), closes the connection and hangs the call up. It doesn't want HANGUP after its
-own ERROR. The agent's program closing the connection, sending HANGUP, or not taking
+sends ERROR 2 (after every frame still waiting), closes the connection and hangs the call up.
+It doesn't want HANGUP after its own ERROR.
+
+After HANGUP or ERROR, consort-line shuts its end of the connection and reads and drops
+whatever the agent's program still sends, until the agent's program closes its end or 2
+seconds pass, and only then closes the socket. On Windows a socket closed with bytes unread,
+or that bytes reach once it is closed, ends in a reset that drops everything not yet read, so
+an agent's program still speaking would lose the last frames. The agent's program closes its
+end once it has read HANGUP, ERROR or the end of the connection.
+
+The agent's program closing the connection, sending HANGUP, or not taking
 consort-line's frames for 2 seconds also hangs the call up. The 2 seconds count from when the
 connection holds no more frames: consort-line sets its own send buffer to 2,048 bytes, and
 the agent's program sets its socket's receive buffer to 4,096 bytes (`SO_RCVBUF`, before it

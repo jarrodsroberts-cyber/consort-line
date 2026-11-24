@@ -30,6 +30,9 @@ enum {
 	KEYS_A_SECOND = 10,
 };
 
+/** A command's id, at most 2^53 - 1: re reads numbers as doubles, exact only up to there */
+#define ID_TOP 9007199254740991LL
+
 /**
  * A call, by an id of the add-on's own: never baresip's call_id, which for an incoming call
  * is the far end's Call-ID, chosen by whoever calls (two calls could share one).
@@ -547,12 +550,16 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		break;
 
 	case BEVENT_CALL_LOCAL_SDP:
-		/* The offer comes right after the streams are made, before any audio. It is raised
-		 * inside ua_connect, so a call whose audio can't be named is refused with an error,
-		 * never hung up here: ua_connect then frees the call without closing it, and dial
-		 * drops its ccall. A hang-up here would free the call under ua_connect */
-		if (cc && !cc->incoming && !name_devices(cc))
+		/* The offer comes right after the streams are made, before any audio: inside
+		 * ua_connect, or in a DNS answer's callback. A call whose audio can't be named is
+		 * never hung up here, where that would free it under ua_connect. The error empties
+		 * this first INVITE (over UDP re drops it, and would build it again at T1), and the
+		 * main loop hangs the call up before then, which ends its transaction. Should
+		 * ua_connect fail instead, dial drops the ccall, and the post finds no call */
+		if (cc && !cc->incoming && !name_devices(cc)) {
 			bevent_set_error(event, ENOMEM);
+			post(POST_ENDED, cc->id, CL_END_FAILED, NULL);
+		}
 		break;
 
 	case BEVENT_CALL_RINGING:
@@ -748,56 +755,120 @@ static bool only_keys(const struct odict *od, const char *const *keys, size_t n)
 }
 
 
+static bool is_space(char c)
+{
+	return c == ' ' || c == '\t' || c == '\r';
+}
+
+
+/** A JSON escape this refuses: a NUL (re decodes it to a NUL byte, where a C string ends) or
+ * a surrogate (re drops one that stands alone, so "do" and a "do" with one would be alike) */
+static bool bad_escape(const char *s, size_t left)
+{
+	if (left < 5 || s[0] != 'u')
+		return false;
+	if (0 == memcmp(s + 1, "0000", 4))
+		return true;
+
+	return (s[1] == 'd' || s[1] == 'D') &&
+	       ((s[2] >= '8' && s[2] <= '9') || (s[2] >= 'a' && s[2] <= 'f') ||
+		(s[2] >= 'A' && s[2] <= 'F'));
+}
+
+
 /**
- * One JSON object and nothing after it but spaces. re's decoder stops at the object's '}'
- * and never reads on, so this finds that '}' as re does: the lines are flat (no value is an
- * object or an array), and a quote opens a string only where a name or a value starts. An
- * escaped NUL (a backslash, then u0000) is refused too: re decodes it to a NUL byte, where a
- * C string would end.
+ * One flat JSON object and nothing after it but spaces: each member a name, a colon and a
+ * value (a string, or a word such as a number), the members split by commas, no value an
+ * object or an array. re's decoder is looser: it stops at the object's '}' and never reads
+ * on, and it drops a name that has no value, an empty member and a trailing comma, so a key
+ * there twice, or one a command doesn't take, could reach no check. Every name re reads here
+ * has its value, and reaches only_keys.
  */
 static bool one_object(const char *s, size_t len)
 {
-	bool quoted = false, esc = false;
-	char last = 0;   /* the last character outside a string, spaces aside */
-	size_t i;
+	enum { NAME, COLON, VALUE, NEXT } want = NAME;
+	bool quoted = false, esc = false, word = false;
+	size_t i = 0;
 
-	for (i = 0; i < len; i++) {
+	while (i < len && is_space(s[i]))
+		++i;
+	if (i == len || s[i] != '{')
+		return false;
+
+	for (++i; i < len; i++) {
 		const char c = s[i];
 
 		if (quoted) {
-			if (esc && c == 'u' && len - i > 4 && 0 == memcmp(s + i + 1, "0000", 4))
-				return false;
-			if (esc)
+			if (esc) {
+				if (bad_escape(s + i, len - i))
+					return false;
 				esc = false;
-			else if (c == '\\')
+			}
+			else if (c == '\\') {
 				esc = true;
-			else if (c == '"')
+			}
+			else if (c == '"') {
 				quoted = false;
+				want = want == NAME ? COLON : NEXT;
+			}
 			continue;
 		}
 
-		if (c == ' ' || c == '\t' || c == '\r')
+		if (word) {
+			if (!is_space(c) && c != ',' && c != '}') {
+				if (c == '"' || c == ':' || c == '{' || c == '[' || c == ']')
+					return false;
+				continue;
+			}
+			word = false;
+			want = NEXT;
+		}
+
+		if (is_space(c))
 			continue;
-		if (last ? (c == '{' || c == '[') : c != '{')
-			return false;
-		if (c == '"' && last != '{' && last != ',' && last != ':')
-			return false;
-		if (c == '}')
+
+		switch (want) {
+
+		case NAME:
+			if (c != '"')
+				return false;
+			quoted = true;
 			break;
 
-		quoted = c == '"';
-		last = c;
+		case COLON:
+			if (c != ':')
+				return false;
+			want = VALUE;
+			break;
+
+		case VALUE:
+			if (c == '"')
+				quoted = true;
+			else if (c == ',' || c == '}' || c == ':' || c == '{' || c == '[' ||
+				 c == ']')
+				return false;
+			else
+				word = true;
+			break;
+
+		case NEXT:
+			if (c == ',') {
+				want = NAME;
+				break;
+			}
+			if (c != '}')
+				return false;
+
+			/* The object's end: nothing after it but spaces */
+			while (++i < len) {
+				if (!is_space(s[i]))
+					return false;
+			}
+			return true;
+		}
 	}
 
-	if (i == len)
-		return false;
-
-	while (++i < len) {
-		if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r')
-			return false;
-	}
-
-	return true;
+	return false;
 }
 
 
@@ -842,7 +913,11 @@ static void broken(const char *why)
 }
 
 
-/** A dial's address: sip: and printable ASCII, no spaces, no <>"; and nothing past URI_MAX */
+/**
+ * A dial's address: sip: and printable ASCII, no spaces and none of < > " ; ?, nothing past
+ * URI_MAX. So no URI parameters, and no URI headers: baresip would send a ?Replaces= as a
+ * Replaces header, which asks the far end to hand over another of its calls
+ */
 static bool good_uri(const char *to)
 {
 	const size_t n = str_len(to);
@@ -852,7 +927,8 @@ static bool good_uri(const char *to)
 
 	for (size_t i = 0; i < n; i++) {
 		const unsigned char c = (unsigned char)to[i];
-		if (c <= 0x20 || c > 0x7e || c == '<' || c == '>' || c == '"' || c == ';')
+		if (c <= 0x20 || c > 0x7e || c == '<' || c == '>' || c == '"' || c == ';' ||
+		    c == '?')
 			return false;
 	}
 
@@ -877,9 +953,11 @@ static void command(const char *line, size_t len)
 		goto out;
 	}
 
+	/* re reads every number as a double: past ID_TOP an id would come back rounded */
 	e = odict_lookup(od, "id");
 	what = odict_string(od, "do");
-	if (!e || odict_entry_type(e) != ODICT_INT || odict_entry_int(e) < 1 || !what) {
+	if (!e || odict_entry_type(e) != ODICT_INT || odict_entry_int(e) < 1 ||
+	    odict_entry_int(e) > ID_TOP || !what) {
 		broken("a command without its id or do");
 		goto out;
 	}
@@ -891,8 +969,12 @@ static void command(const char *line, size_t len)
 		struct call *call = NULL;
 		struct ccall *cc;
 
-		if (!only_keys(od, dial_keys, RE_ARRAY_SIZE(dial_keys)) || !good_uri(to)) {
+		if (!only_keys(od, dial_keys, RE_ARRAY_SIZE(dial_keys)) || !to) {
 			broken("a dial that isn't one");
+			goto out;
+		}
+		if (!good_uri(to)) {
+			reply(id, false, NULL, "an address the line doesn't take");
 			goto out;
 		}
 		if (!le) {

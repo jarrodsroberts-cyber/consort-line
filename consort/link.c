@@ -39,6 +39,7 @@ enum {
 	OUT_BYTES   = 65536,    /**< The line's frames waiting for Consort      */
 	SEND_BUFFER = 2048,     /**< The kernel's share of them: a few frames   */
 	LAST_BUFFER = 1 << 20,  /**< The kernel's room once the last frame comes: all of them */
+	LINGER_US   = 2000000,  /**< After it, Consort's bytes are read until it closes, or this */
 	MAX_KEYS    = 32,
 };
 
@@ -174,6 +175,66 @@ static void flush_last(struct cl_link *l)
 }
 
 
+/** The closer's thread: Consort's bytes read and dropped until it closes, or LINGER_US */
+static DWORD WINAPI drain_close(LPVOID arg)
+{
+	const SOCKET s = (SOCKET)(UINT_PTR)arg;
+	const uint64_t until = now_us() + LINGER_US;
+	char sink[1024];
+
+	while (now_us() < until) {
+		struct timeval tv = {0, 100000};   /* the limit is looked at every 100 ms */
+		fd_set readable;
+		int n;
+
+		FD_ZERO(&readable);
+		FD_SET(s, &readable);
+		n = select(0, &readable, NULL, NULL, &tv);
+		if (n == SOCKET_ERROR)
+			break;
+		if (n == 0)
+			continue;
+
+		n = recv(s, sink, (int)sizeof(sink), 0);
+		if (n == 0 || (n == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK))
+			break;
+	}
+
+	(void)closesocket(s);
+
+	return 0;
+}
+
+
+/**
+ * Closes Consort's connection after the line's last frame (HANGUP or ERROR) without losing
+ * what waits for Consort. On Windows a socket closed with Consort's bytes unread, or that
+ * Consort's bytes reach once it is closed, ends in a reset, which drops every frame Consort
+ * hasn't read: the usual case for a Consort that is behind and still speaking. So the line's
+ * end is shut, and a thread of its own reads what Consort still sends until Consort closes
+ * its end, or for LINGER_US, before the socket goes. Neither the link nor baresip waits for
+ * it. With no thread to be had, close_all closes the socket at once, as before.
+ */
+static void close_last(struct cl_link *l)
+{
+	HANDLE t = NULL;
+
+	if (l->conn == INVALID_SOCKET)
+		return;
+
+	(void)shutdown(l->conn, SD_SEND);
+
+	/* Off the event the link's sockets share, which goes with the link */
+	if (0 == WSAEventSelect(l->conn, NULL, 0))
+		t = CreateThread(NULL, 0, drain_close, (LPVOID)(UINT_PTR)l->conn, 0, NULL);
+	if (!t)
+		return;
+
+	CloseHandle(t);
+	l->conn = INVALID_SOCKET;   /* the closer's now */
+}
+
+
 static void end(struct cl_link *l, enum cl_end why)
 {
 	if (l->ended)
@@ -192,6 +253,7 @@ static void end(struct cl_link *l, enum cl_end why)
 			l->outlen += n;
 			(void)flush_out(l);
 			flush_last(l);
+			close_last(l);
 		}
 	}
 
@@ -693,8 +755,10 @@ static DWORD WINAPI run(LPVOID arg)
 			/* The far end hung up: what waited for Consort, HANGUP, then nothing more */
 			if (l->proved)
 				send_frame(l, CL_HANGUP, NULL, 0);
-			if (!l->ended)
+			if (!l->ended) {
 				flush_last(l);
+				close_last(l);
+			}
 			l->ended = true;
 			close_all(l);
 		}
