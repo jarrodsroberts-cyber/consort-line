@@ -25,6 +25,10 @@ env:
   # The release is built with g711 alone besides the add-on. The tests' far end (never
   # released) is built apart, with what it plays, records and answers with.
   TEST_MODULES: g711;aufile;ctrl_tcp;menu;aubridge;echo
+  # The C runtime linked in (/MT), so consort-line.exe needs only Windows' own DLLs, never a
+  # Visual C++ Redistributable. The same for re and both baresip builds, which share re's
+  # library and its C11 threads check.
+  MSVC_CRT: MultiThreaded
   VCVARS: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat
 
 jobs:
@@ -74,21 +78,21 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cmake -S deps/re -B deps/re/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIBRE_BUILD_SHARED=OFF || exit /b 1
+          cmake -S deps/re -B deps/re/build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MSVC_RUNTIME_LIBRARY=%MSVC_CRT%" -DLIBRE_BUILD_SHARED=OFF || exit /b 1
           cmake --build deps/re/build -j || exit /b 1
 
       - name: Build consort-line (the release)
         shell: cmd
         run: |
           call "%VCVARS%"
-          cmake -S deps/baresip -B deps/build-line -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DMODULES=g711 "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort || exit /b 1
+          cmake -S deps/baresip -B deps/build-line -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MSVC_RUNTIME_LIBRARY=%MSVC_CRT%" -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DMODULES=g711 "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort || exit /b 1
           cmake --build deps/build-line -j --target consort-line || exit /b 1
 
       - name: Build the tests' far end (never released)
         shell: cmd
         run: |
           call "%VCVARS%"
-          cmake -S deps/baresip -B deps/build-test -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE "-DMODULES=%TEST_MODULES%" "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort -DCONSORT_LINE_CALLER=ON || exit /b 1
+          cmake -S deps/baresip -B deps/build-test -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MSVC_RUNTIME_LIBRARY=%MSVC_CRT%" -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE "-DMODULES=%TEST_MODULES%" "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort -DCONSORT_LINE_CALLER=ON || exit /b 1
           cmake --build deps/build-test -j --target consort-line-caller || exit /b 1
 
       - name: Where the programs are
@@ -109,6 +113,17 @@ jobs:
           echo "standard output: $out (exit $code)"
           test "$out" = '{"event":"failed","why":"secret"}'
           test "$code" = 2
+
+      # No Visual C++ Redistributable on the PCs that run it: the runner has one, so a line
+      # that needed it would pass every test here and fail to start there
+      - name: The line needs only Windows' own DLLs
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          dumpbin /nologo /dependents "%LINE_EXE%" > deps\dependents.txt || exit /b 1
+          type deps\dependents.txt
+          findstr /i "vcruntime msvcp" deps\dependents.txt && exit /b 1
+          exit /b 0
 
       - name: Build and run the add-on's own tests
         shell: cmd

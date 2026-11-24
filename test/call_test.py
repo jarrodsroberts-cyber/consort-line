@@ -651,6 +651,9 @@ def a_hang_up_then_quit_with_consort_behind(line_exe: str, caller_exe: str, root
         reply = line.send(do="quit")
         check(reply.get("event") == "reply" and reply.get("ok") is True,
               f"  Consort says quit at once ({reply})")
+        time.sleep(0.3)                       # still behind and speaking: the line must wait
+        check(line.proc.poll() is None,
+              "  the line still waits for this connection before it exits")
         conn.start_reading()                  # and catches up only now
         kinds = []
         while True:
@@ -660,14 +663,16 @@ def a_hang_up_then_quit_with_consort_behind(line_exe: str, caller_exe: str, root
             kinds.append(got[1])
         speaking.clear()
         audio = kinds.count(AUDIO)
-        check(bool(kinds) and kinds[-1] == HANGUP and audio >= 40,
-              f"  every frame that waited still comes, then HANGUP ({audio} frames, "
-              f"then {kinds[-1] if kinds else None})")
+        # figures' sent is counted as each tick starts: one short of the frames sent
+        sent = (closed.get("figures") or {}).get("sent", 1 << 30)
+        check(bool(kinds) and kinds[-1] == HANGUP and audio >= sent,
+              f"  every frame that waited still comes, then HANGUP ({audio} frames of "
+              f"{sent} counted, then {kinds[-1] if kinds else None})")
         check(got is not None and not conn.reset,
               f"  then the end, not a reset (ended: {got is not None}, reset: {conn.reset})")
         conn.close()
-        code = line.exit_code()
-        check(code == 0, f"  and the line exits 0 ({code})")
+        code = line.exit_code(within=1.0)
+        check(code == 0, f"  and the line exits 0 once Consort closes its end ({code})")
     finally:
         speaking.clear()
         if conn is not None:
