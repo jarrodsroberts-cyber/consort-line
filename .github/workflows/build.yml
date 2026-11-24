@@ -1,0 +1,165 @@
+# Builds consort-line (baresip and the add-on as one program) on Windows, runs the add-on's
+# own tests and whole calls on 127.0.0.1, and on a tag (v*) makes the release Consort pins.
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # Everything the build takes from elsewhere, pinned: re and baresip by commit (their
+  # v4.13.0 tags), and OpenSSL as baresip's own Windows build takes it, by its SHA-256.
+  RE_COMMIT: b827bcaf55a18be141ca7bcee1e22872a3a29656
+  BARESIP_COMMIT: 8a4f18c1c1b5331daa026236dcdd108deff601e8
+  OPENSSL_URL: https://github.com/baresip/tools/releases/download/v2026.10.0/openssl-windows-x64.zip
+  OPENSSL_SHA256: 35dcf7d7dc47c7557f89c58202de031be0bbdd3854ed4f13270ebc9342adab07
+  # The release is built with g711 alone besides the add-on. The tests' far end (never
+  # released) is built apart, with what it plays, records and answers with.
+  TEST_MODULES: g711;aufile;ctrl_tcp;menu;aubridge;echo
+  VCVARS: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat
+
+jobs:
+  build:
+    name: Build and test on Windows
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      # Pinned to exact commits, so an action can't change under us.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch re and baresip at their pinned commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pair in "re https://github.com/baresip/re.git $RE_COMMIT" \
+                      "baresip https://github.com/baresip/baresip.git $BARESIP_COMMIT"; do
+            set -- $pair
+            git init -q "deps/$1"
+            git -C "deps/$1" fetch -q --depth 1 "$2" "$3"
+            git -C "deps/$1" checkout -q FETCH_HEAD
+            test "$(git -C "deps/$1" rev-parse HEAD)" = "$3"
+            echo "$1 at $3"
+          done
+
+      - name: Fetch OpenSSL and check it
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o deps/openssl.zip "$OPENSSL_URL"
+          echo "$OPENSSL_SHA256  deps/openssl.zip" | sha256sum -c -
+          7z x -odeps deps/openssl.zip > /dev/null
+          echo "OPENSSL_ROOT_DIR=$GITHUB_WORKSPACE\\deps\\openssl-windows-x64" >> "$GITHUB_ENV"
+
+      - name: Build re
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake -S deps/re -B deps/re/build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+          cmake --build deps/re/build -j || exit /b 1
+
+      - name: Build consort-line (the release)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake -S deps/baresip -B deps/build-line -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DMODULES=g711 "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort || exit /b 1
+          cmake --build deps/build-line -j --target consort-line || exit /b 1
+
+      - name: Build the tests' far end (never released)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake -S deps/baresip -B deps/build-test -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC=ON -DOPENSSL_USE_STATIC_LIBS=TRUE "-DMODULES=%TEST_MODULES%" "-DAPP_MODULES_DIR=%GITHUB_WORKSPACE%" -DAPP_MODULES=consort -DCONSORT_LINE_CALLER=ON || exit /b 1
+          cmake --build deps/build-test -j --target consort-line-caller || exit /b 1
+
+      - name: Where the programs are
+        shell: bash
+        run: |
+          set -euo pipefail
+          line=$(find deps/build-line -name consort-line.exe | head -1)
+          caller=$(find deps/build-test -name consort-line-caller.exe | head -1)
+          test -n "$line" && test -n "$caller"
+          echo "LINE_EXE=$line" >> "$GITHUB_ENV"
+          echo "CALLER_EXE=$caller" >> "$GITHUB_ENV"
+          echo "line $line, caller $caller"
+          # With no secret it says so on standard output, and nothing else, and exits 2
+          set +e
+          out=$("$line" < /dev/null)
+          code=$?
+          set -e
+          echo "standard output: $out (exit $code)"
+          test "$out" = '{"event":"failed","why":"secret"}'
+          test "$code" = 2
+
+      - name: Build and run the add-on's own tests
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake -S test -B build/unit -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+          cmake --build build/unit -j || exit /b 1
+          build\unit\unit.exe
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Whole calls on 127.0.0.1
+        shell: bash
+        run: python -I test/call_test.py "$LINE_EXE" "$CALLER_EXE"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^#define CONSORT_LINE_VERSION "\(.*\)"$/\1/p' consort/consort.h)
+          test -n "$version"
+          name="consort-line-$version-windows-x64"
+          mkdir -p "dist/$name/licenses"
+          cp "$LINE_EXE" "dist/$name/"
+          cp README.md PROTOCOL.md "dist/$name/"
+          cp LICENSE "dist/$name/licenses/consort-line.txt"
+          cp deps/baresip/LICENSE "dist/$name/licenses/baresip.txt"
+          cp deps/re/LICENSE "dist/$name/licenses/re.txt"
+          find deps/openssl-windows-x64 -maxdepth 2 -iname 'LICENSE*' -exec cp {} "dist/$name/licenses/openssl.txt" \; -quit
+          test -s "dist/$name/licenses/openssl.txt"
+          (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: consort-line
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Make the release from this run's build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" -n consort-line -D dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "Built by this repository's CI from $GITHUB_SHA. SHA256SUMS lists the zip's SHA-256."

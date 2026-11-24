@@ -1,0 +1,2 @@
+# LF everywhere, on every checkout: CI's scripts read these files line by line.
+* text=auto eol=lf
