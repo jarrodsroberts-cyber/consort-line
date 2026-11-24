@@ -175,6 +175,10 @@ static void flush_last(struct cl_link *l)
 }
 
 
+/** Closers still draining: the line's exit waits for them (cl_link_settle) */
+static volatile LONG closers;
+
+
 /** The closer's thread: Consort's bytes read and dropped until it closes, or LINGER_US */
 static DWORD WINAPI drain_close(LPVOID arg)
 {
@@ -201,6 +205,7 @@ static DWORD WINAPI drain_close(LPVOID arg)
 	}
 
 	(void)closesocket(s);
+	(void)InterlockedDecrement(&closers);
 
 	return 0;
 }
@@ -225,13 +230,27 @@ static void close_last(struct cl_link *l)
 	(void)shutdown(l->conn, SD_SEND);
 
 	/* Off the event the link's sockets share, which goes with the link */
-	if (0 == WSAEventSelect(l->conn, NULL, 0))
+	if (0 == WSAEventSelect(l->conn, NULL, 0)) {
+		(void)InterlockedIncrement(&closers);
 		t = CreateThread(NULL, 0, drain_close, (LPVOID)(UINT_PTR)l->conn, 0, NULL);
+		if (!t)
+			(void)InterlockedDecrement(&closers);
+	}
 	if (!t)
 		return;
 
 	CloseHandle(t);
 	l->conn = INVALID_SOCKET;   /* the closer's now */
+}
+
+
+void cl_link_settle(void)
+{
+	/* A closer looks at its limit every 100 ms, so it may end a little after its 2 s */
+	const uint64_t until = now_us() + LINGER_US + 200000;
+
+	while (InterlockedCompareExchange(&closers, 0, 0) > 0 && now_us() < until)
+		Sleep(10);
 }
 
 

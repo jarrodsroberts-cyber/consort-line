@@ -24,7 +24,8 @@ it last. [PROTOCOL.md](PROTOCOL.md) has the whole contract, and what it guards a
 ## Building
 
 Only on CI ([.github/workflows/build.yml](.github/workflows/build.yml)): Windows, MSVC, CMake
-and Ninja. re and baresip come from their v4.13.0 commits, and OpenSSL is baresip's own
+and Ninja. re and baresip come from their v4.13.0 commits, with two later fixes from re's
+own main branch to its SIP requests ([patches/](patches)), and OpenSSL is baresip's own
 prebuilt zip for Windows, checked by its SHA-256. The add-on is built inside baresip's build
 as an app module, so `consort-line.exe` links libbaresip statically.
 

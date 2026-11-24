@@ -200,9 +200,10 @@ def frame(kind: int, payload: bytes = b"") -> bytes:
 
 class Conn:
     """A call's connection, as Consort makes it: proves itself, checks the line's proof, and
-    reads every frame on a thread of its own, with the moment it came."""
+    reads every frame on a thread of its own, with the moment it came (from the start, or from
+    start_reading for a Consort that is behind). `reset`: the connection ended in a reset."""
 
-    def __init__(self, secret: bytes, answered: dict):
+    def __init__(self, secret: bytes, answered: dict, reading: bool = True):
         port, nonce = answered["port"], bytes.fromhex(answered["nonce"])
         # As PROTOCOL.md asks: a receive buffer of 4,096 bytes, set before connecting
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -214,7 +215,12 @@ class Conn:
         back = self._exactly(19)
         self.proved = back == frame(ID, proof(secret, nonce, b"line", port))
         self.frames: queue.Queue = queue.Queue()
+        self.reset = False
         self.sock.settimeout(None)
+        if reading:
+            self.start_reading()
+
+    def start_reading(self) -> None:
         threading.Thread(target=self._read, daemon=True).start()
 
     def _exactly(self, n: int) -> bytes:
@@ -235,7 +241,7 @@ class Conn:
                 payload = self._exactly(int.from_bytes(header[1:], "big"))
                 self.frames.put((time.perf_counter(), header[0], payload))
         except OSError:
-            pass
+            self.reset = True
         self.frames.put((time.perf_counter(), None, b""))
 
     def next(self, kinds: set[int], within: float = 5.0):
@@ -602,6 +608,74 @@ def standard_output_going(line_exe: str, caller_exe: str, root: Path) -> None:
             far.stop()
 
 
+def a_hang_up_then_quit_with_consort_behind(line_exe: str, caller_exe: str, root: Path) -> None:
+    print("The far end hangs up while Consort is behind and speaking, and Consort quits at once")
+    silence = root / "silence.wav"
+    write_wav(silence, array.array("h", bytes(2 * RATE * 10)))
+    far_sip, ctrl_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
+    far = FarEnd(caller_exe, root / "caller", far_sip, "sip:caller@127.0.0.1", [
+        f"audio_source\t\taufile,{silence}",
+        f"audio_player\t\taufile,{root / 'heard.wav'}",
+        "module\t\t\taufile.so", "module_app\t\tmenu.so", "module_app\t\tctrl_tcp.so",
+        f"ctrl_tcp_listen\t\t127.0.0.1:{ctrl_port}"])
+    line = Line(line_exe, root / "line")
+    speaking = threading.Event()
+    conn = None
+
+    def speak() -> None:
+        while speaking.is_set():
+            try:
+                conn.send(AUDIO, bytes(2 * SAMPLES))
+            except OSError:
+                return
+            time.sleep(0.02)
+
+    try:
+        hello = hello_of(line)
+        ctrl = Ctrl(ctrl_port)
+        ctrl.do("dial", f"sip:line@127.0.0.1:{hello['sip'].rsplit(':', 1)[1]}")
+        incoming = line.wait({"incoming"})
+        line.send(do="accept", call=incoming.get("call", ""))
+        answered = line.wait({"answered"})
+        if not check(answered.get("event") == "answered",
+                     f"the call is answered ({answered.get('event')})"):
+            return
+        conn = Conn(line.secret, answered, reading=False)
+        check(conn.proved, "  both ends prove themselves")
+        speaking.set()
+        threading.Thread(target=speak, daemon=True).start()
+        time.sleep(1.2)                       # Consort reads nothing: behind by 60 frames
+        ctrl.do("hangup")
+        closed = line.wait({"closed"})
+        check(closed.get("event") == "closed", f"  the far end hangs up: closed ({closed})")
+        reply = line.send(do="quit")
+        check(reply.get("event") == "reply" and reply.get("ok") is True,
+              f"  Consort says quit at once ({reply})")
+        conn.start_reading()                  # and catches up only now
+        kinds = []
+        while True:
+            got = conn.next({AUDIO, HANGUP, ERROR}, within=5)
+            if got is None or got[1] is None:
+                break
+            kinds.append(got[1])
+        speaking.clear()
+        audio = kinds.count(AUDIO)
+        check(bool(kinds) and kinds[-1] == HANGUP and audio >= 40,
+              f"  every frame that waited still comes, then HANGUP ({audio} frames, "
+              f"then {kinds[-1] if kinds else None})")
+        check(got is not None and not conn.reset,
+              f"  then the end, not a reset (ended: {got is not None}, reset: {conn.reset})")
+        conn.close()
+        code = line.exit_code()
+        check(code == 0, f"  and the line exits 0 ({code})")
+    finally:
+        speaking.clear()
+        if conn is not None:
+            conn.close()
+        line.stop()
+        far.stop()
+
+
 def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
     print("The control channel")
     secret_line = json.dumps({"line": 1, "secret": "11" * 32}).encode()
@@ -674,6 +748,7 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
         ("a command with a trailing comma", b'{"id": 1, "do": "quit",}'),
         ("a key with a lone surrogate", b'{"id": 1, "do\\udc00": "quit"}'),
         ("an id past 2^53 - 1", b'{"id": 9007199254740992, "do": "quit"}'),
+        ("a dial whose to isn't a string", b'{"id": 1, "do": "dial", "to": null}'),
         ("a line past 4,096 bytes", b"x" * 5000),
     ]
     for n, (what, data) in enumerate(broken):
@@ -778,7 +853,8 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory(prefix="consort-line-") as made:
         root = Path(made)
         for test in (a_call_that_rings_here, a_call_at_30_ms, a_call_placed_to_an_echo,
-                     two_lines, standard_output_going, the_control_channel):
+                     two_lines, standard_output_going, a_hang_up_then_quit_with_consort_behind,
+                     the_control_channel):
             folder = root / test.__name__
             folder.mkdir()
             before = len(FAILED)

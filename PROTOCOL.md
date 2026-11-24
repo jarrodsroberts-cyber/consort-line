@@ -53,8 +53,9 @@ beyond them:
 - `{"id": 1, "do": "dial", "to": "sip:..."}` places a call from the line's account. `to` is
   `sip:` and then printable ASCII, with no spaces and none of `<`, `>`, `"`, `;` or `?` (so no
   URI parameters or headers: baresip would send a `?Replaces=` as a Replaces header), 512
-  bytes at most. Any other `to` is refused in the reply (`why`: "an address the line doesn't
-  take"), and the line goes on.
+  bytes at most. Any other `to` string is refused in the reply (`why`: "an address the line
+  doesn't take"), and the line goes on. A dial whose `to` is missing or isn't a string isn't
+  this form, and nor is one with an escaped NUL or surrogate in it (below).
 - `{"id": 2, "do": "accept", "call": "<id>"}` answers a call that rang.
 - `{"id": 3, "do": "hangup", "call": "<id>"}`
 - `{"id": 4, "do": "quit"}` hangs up every call and exits.
@@ -150,7 +151,8 @@ whatever the agent's program still sends, until the agent's program closes its e
 seconds pass, and only then closes the socket. On Windows a socket closed with bytes unread,
 or that bytes reach once it is closed, ends in a reset that drops everything not yet read, so
 an agent's program still speaking would lose the last frames. The agent's program closes its
-end once it has read HANGUP, ERROR or the end of the connection.
+end once it has read HANGUP, ERROR or the end of the connection. When consort-line exits it
+waits for connections still closing this way (2 seconds at most) before it goes.
 
 The agent's program closing the connection, sending HANGUP, or not taking
 consort-line's frames for 2 seconds also hangs the call up. The 2 seconds count from when the

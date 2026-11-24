@@ -1,0 +1,26 @@
+re 4d4475561496f7e4e13bad5f37b3ffcd9e604ddc (re's main branch, 2026-11-19, #1660), its
+src/sip/request.c hunk alone: "sip: free a request released before any response". A
+call hung up before any 1xx kept its request (about 2.4 kB) until re closed.
+
+diff --git a/src/sip/request.c b/src/sip/request.c
+index f6064c8a8..2066f00c6 100644
+--- a/src/sip/request.c
++++ b/src/sip/request.c
+@@ -74,10 +74,13 @@ static void destructor(void *arg)
+ 		/* user does deref before request has completed */
+ 		*req->reqp = NULL;
+ 		req->reqp  = NULL;
+-		req->sendh = NULL;
+-		req->resph = NULL;
+-		sip_request_cancel(mem_ref(req));
+-		return;
++
++		if (req->provrecv) {
++			req->sendh = NULL;
++			req->resph = NULL;
++			sip_request_cancel(mem_ref(req));
++			return;
++		}
+ 	}
+ 
+ 	list_flush(&req->cachel);

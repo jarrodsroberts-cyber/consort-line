@@ -1438,8 +1438,10 @@ static int module_close(void)
 	tmr_cancel(&g.quit);
 	bevent_unregister(event_handler);
 
-	/* Every link's thread stops here, so none can post again */
+	/* Every link's thread stops here, so none can post again. Then the connections still
+	 * closing after a HANGUP or an ERROR get their 2 s: re's cleanup would reset them */
 	list_flush(&g.calls_list);
+	cl_link_settle();
 
 	g.ausrc = mem_deref(g.ausrc);
 	g.auplay = mem_deref(g.auplay);

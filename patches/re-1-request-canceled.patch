@@ -1,0 +1,19 @@
+re 99de9befec3eaf28fc1c34065f1a284f13ddf5f1 (re's main branch, 2026-11-08), its
+src/sip/request.c hunk alone: "sip: do not send a request canceled during DNS
+resolution". A call hung up while its target was still being looked up sent its INVITE
+anyway once the lookup finished.
+
+diff --git a/src/sip/request.c b/src/sip/request.c
+index 7ff0fb469..f6064c8a8 100644
+--- a/src/sip/request.c
++++ b/src/sip/request.c
+@@ -258,6 +258,9 @@ static int request_next(struct sip_request *req)
+ 	struct sa dst;
+ 	int err;
+ 
++	if (req->canceled)
++		return ECANCELED;
++
+  again:
+ 	rr = list_ledata(req->addrl.head);
+ 	if (!rr) {

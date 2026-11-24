@@ -1045,6 +1045,7 @@ static void ends_while_consort_is_behind(bool far_end, bool talking)
 	unsigned audio = 0, gaps = 0;
 	int16_t v, prev = 0, pulled;
 	HANDLE th = NULL;
+	DWORD ended_at, spent;
 	int r;
 	SOCKET s;
 
@@ -1072,6 +1073,12 @@ static void ends_while_consort_is_behind(bool far_end, bool talking)
 		InterlockedExchange(&t.breaks, 1);
 	else
 		CHECK(send_frame(s, CL_DTMF, &key, 1));
+	ended_at = GetTickCount();
+
+	/* Speaking, Consort goes on unread a while: its frames reach the line's socket after the
+	 * line's last frame, whatever the clock's ticks, as a busy Consort's do */
+	if (th)
+		Sleep(200);
 
 	while ((r = read_frame(s, &type, payload, &len)) == 1) {
 		last = type;
@@ -1086,6 +1093,11 @@ static void ends_while_consort_is_behind(bool far_end, bool talking)
 		prev = v;
 		++audio;
 	}
+
+	/* The end came soon after the last frame: the line shut its end at once (it would come
+	 * only after the 2 s without the shutdown) */
+	spent = GetTickCount() - ended_at;
+	CHECK(spent < 1000);
 
 	if (th) {
 		InterlockedExchange(&t.stop, 1);
@@ -1102,8 +1114,9 @@ static void ends_while_consort_is_behind(bool far_end, bool talking)
 	CHECK(far_end || code == CL_ERR_FRAME);
 	CHECK(gaps == 0 && audio >= 50);      /* about 75: 1.5 s of frames */
 	CHECK(prev == pulled);                /* the last frame the line pulled came too */
-	printf("  %s with Consort behind%s: %u frames, then 0x%02x and the end (%d)\n",
-	       how, talking ? " and speaking" : "", audio, last, r);
+	printf("  %s with Consort behind%s: %u frames, then 0x%02x and the end (%d), %lu ms "
+	       "from the hang-up or the rule broken\n", how, talking ? " and speaking" : "",
+	       audio, last, r, (unsigned long)spent);
 
 	closesocket(s);
 	call_end(&c);

@@ -46,10 +46,19 @@ jobs:
                       "baresip https://github.com/baresip/baresip.git $BARESIP_COMMIT"; do
             set -- $pair
             git init -q "deps/$1"
+            # The files as they are stored (LF), so the patches below apply
+            git -C "deps/$1" config core.autocrlf false
             git -C "deps/$1" fetch -q --depth 1 "$2" "$3"
             git -C "deps/$1" checkout -q FETCH_HEAD
             test "$(git -C "deps/$1" rev-parse HEAD)" = "$3"
             echo "$1 at $3"
+          done
+          # Two fixes from re's own main branch, after v4.13.0, to src/sip/request.c alone
+          # (each patch says which commit it is and what it fixes)
+          for p in patches/re-*.patch; do
+            git -C deps/re apply --check "$PWD/$p"
+            git -C deps/re apply "$PWD/$p"
+            echo "re: $p applied"
           done
 
       - name: Fetch OpenSSL and check it
