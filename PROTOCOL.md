@@ -137,7 +137,9 @@ own ERROR. The agent's program closing the connection, sending HANGUP, or not ta
 consort-line's frames for 2 seconds also hangs the call up. The 2 seconds count from when the
 connection holds no more frames: consort-line sets its own send buffer to 2,048 bytes, and
 the agent's program sets its socket's receive buffer to 4,096 bytes (`SO_RCVBUF`, before it
-connects), about a quarter of a second of frames.
+connects). The connection then holds about half a second of frames on Windows 11 (26
+measured) and about 1.3 seconds on Windows Server (65), against every frame of 3 seconds and
+more with Windows' own buffer sizes.
 
 ## What it guards against, and what it doesn't
 
