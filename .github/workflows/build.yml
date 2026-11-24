@@ -130,8 +130,10 @@ jobs:
           cp LICENSE "dist/$name/licenses/consort-line.txt"
           cp deps/baresip/LICENSE "dist/$name/licenses/baresip.txt"
           cp deps/re/LICENSE "dist/$name/licenses/re.txt"
-          find deps/openssl-windows-x64 -maxdepth 2 -iname 'LICENSE*' -exec cp {} "dist/$name/licenses/openssl.txt" \; -quit
-          test -s "dist/$name/licenses/openssl.txt"
+          # baresip's OpenSSL zip (4.0.3) carries no licence: licenses/openssl.txt is
+          # OpenSSL's own LICENSE.txt at its openssl-4.0.3 tag (Apache License 2.0)
+          grep -q 'OPENSSL_VERSION_STR "4.0.3"' deps/openssl-windows-x64/include/openssl/opensslv.h
+          cp licenses/openssl.txt "dist/$name/licenses/openssl.txt"
           (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > SHA256SUMS)
           cat dist/SHA256SUMS
 
