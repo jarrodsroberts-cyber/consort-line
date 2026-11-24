@@ -38,6 +38,7 @@ enum {
 	MAX_ACCEPTS = 8,        /**< Connections taken a pass, at most          */
 	OUT_BYTES   = 65536,    /**< The line's frames waiting for Consort      */
 	SEND_BUFFER = 2048,     /**< The kernel's share of them: a few frames   */
+	LAST_BUFFER = 1 << 20,  /**< The kernel's room once the last frame comes: all of them */
 	MAX_KEYS    = 32,
 };
 
@@ -162,7 +163,7 @@ static bool flush_out(struct cl_link *l)
  */
 static void flush_last(struct cl_link *l)
 {
-	const int room = (int)l->outlen + SEND_BUFFER;
+	const int room = LAST_BUFFER;
 
 	if (!l->outlen || l->conn == INVALID_SOCKET)
 		return;
