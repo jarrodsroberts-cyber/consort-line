@@ -10,5 +10,7 @@ add_executable(unit unit.c ../consort/proto.c ../consort/proof.c ../consort/link
 target_include_directories(unit PRIVATE ../consort)
 target_link_libraries(unit PRIVATE ws2_32 bcrypt winmm)
 if(MSVC)
-  target_compile_options(unit PRIVATE /W4 /WX)
+  # Every warning an error, but C4127 ("conditional expression is constant"), which some
+  # versions give for do { } while (0)
+  target_compile_options(unit PRIVATE /W4 /WX /wd4127)
 endif()

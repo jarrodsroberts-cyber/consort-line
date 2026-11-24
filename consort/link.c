@@ -510,7 +510,7 @@ static void tick(struct cl_link *l)
 
 		/* Every 20 ms, whatever the network does: silence while no player is attached */
 		for (unsigned i = 0; i < CL_SAMPLES; i++) {
-			const uint16_t v = heard ? (uint16_t)caller[i] : 0;
+			const uint16_t v = (uint16_t)(heard ? caller[i] : 0);
 			bytes[2 * i] = (uint8_t)(v & 0xff);
 			bytes[2 * i + 1] = (uint8_t)(v >> 8);
 		}
