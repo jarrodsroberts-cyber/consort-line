@@ -81,7 +81,7 @@ static struct {
 	struct list calls_list;
 	struct ausrc *ausrc;
 	struct auplay *auplay;
-	struct tmr hello;
+	struct tmr quit;         /**< Quits from the main loop once output broke */
 	struct log log;
 	struct cl_wake *wake;
 
@@ -98,6 +98,7 @@ static struct {
 	struct ccall *dialed;    /**< The call the dial in progress made      */
 	bool quitting;
 	bool broken;             /**< Standard output can't be written        */
+	int code;                /**< What main.c exits with after re_main    */
 } g;
 
 
@@ -111,7 +112,7 @@ static int print_handler(const char *p, size_t size, void *arg)
 }
 
 
-static void quit_all(const char *why);
+static void quit_broken(void *arg);
 
 
 static void write_line(const struct odict *od)
@@ -128,8 +129,10 @@ static void write_line(const struct odict *od)
 		goto out;
 
 	if (!WriteFile(out, mb->buf, (DWORD)mb->end, &done, NULL) || done != mb->end) {
+		/* Never quit from here: write_line runs inside baresip's call events, and
+		 * quitting there hangs those calls up a second time. The main loop quits */
 		g.broken = true;
-		quit_all("Consort's end of the control channel is gone");
+		tmr_start(&g.quit, 0, quit_broken, NULL);
 	}
 
  out:
@@ -414,7 +417,18 @@ static void closed(struct ccall *cc, const char *why)
 	struct odict *od = NULL, *fig = NULL;
 	char text[TEXT_MAX + 1];
 
-	cl_link_hangup(cc->link);
+	/* Out of the list first: nothing below can find this call or hang it up again. Nor can
+	 * a dial in progress, should the call it is placing close inside ua_connect */
+	cc->call = NULL;
+	list_unlink(&cc->le);
+	if (g.dialed == cc)
+		g.dialed = NULL;
+
+	/* HANGUP only when the far end hung up. cc->why is set when the add-on hung the call up
+	 * (Consort's hangup or quit, its end closing, a rule broken): then the call's connection
+	 * just closes */
+	if (!cc->why)
+		cl_link_hangup(cc->link);
 	cl_link_stats(cc->link, &st);
 
 	/* The add-on's own words when it hung up; else baresip's, made safe */
@@ -441,8 +455,6 @@ static void closed(struct ccall *cc, const char *why)
 	mem_deref(fig);
 	mem_deref(od);
 
-	cc->call = NULL;
-	list_unlink(&cc->le);
 	mem_deref(cc);
 }
 
@@ -535,9 +547,12 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		break;
 
 	case BEVENT_CALL_LOCAL_SDP:
-		/* The offer comes right after the streams are made, before any audio */
+		/* The offer comes right after the streams are made, before any audio. It is raised
+		 * inside ua_connect, so a call whose audio can't be named is refused with an error,
+		 * never hung up here: ua_connect then frees the call without closing it, and dial
+		 * drops its ccall. A hang-up here would free the call under ua_connect */
 		if (cc && !cc->incoming && !name_devices(cc))
-			hang_up(cc, "the call's audio couldn't be made its own");
+			bevent_set_error(event, ENOMEM);
 		break;
 
 	case BEVENT_CALL_RINGING:
@@ -626,9 +641,10 @@ static int src_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		warning("consort: a source for no known call: refused\n");
 		return EINVAL;
 	}
-	if (prm->srate != CL_RATE || prm->ch != 1 || prm->ptime != 20 ||
-	    prm->fmt != AUFMT_S16LE) {
-		warning("consort: a source not at 8000 Hz, one channel, 20 ms: refused\n");
+	/* Any ptime: the link hands baresip 20 ms a tick, and baresip's sender cuts its packets
+	 * from that at whatever a=ptime the far end asked for */
+	if (prm->srate != CL_RATE || prm->ch != 1 || prm->fmt != AUFMT_S16LE) {
+		warning("consort: a source not at 8000 Hz, one channel: refused\n");
 		return ENOTSUP;
 	}
 
@@ -710,17 +726,74 @@ static int play_alloc(struct auplay_st **stp, const struct auplay *ap,
  * Commands, from standard input on the reader thread, run on the main thread
  */
 
+/** Each key one of these (three at most), and none there twice */
 static bool only_keys(const struct odict *od, const char *const *keys, size_t n)
 {
+	unsigned seen = 0;   /* a bit a key */
 	struct le *le;
 
 	for (le = list_head(&od->lst); le; le = le->next) {
 		const struct odict_entry *e = le->data;
-		bool known = false;
+		size_t i = 0;
 
-		for (size_t i = 0; i < n; i++)
-			known = known || 0 == strcmp(odict_entry_key(e), keys[i]);
-		if (!known)
+		while (i < n && 0 != strcmp(odict_entry_key(e), keys[i]))
+			++i;
+		/* Unknown, or there twice: re keeps both, and a lookup finds the first */
+		if (i == n || (seen & (1u << i)))
+			return false;
+		seen |= 1u << i;
+	}
+
+	return true;
+}
+
+
+/**
+ * One JSON object and nothing after it but spaces. re's decoder stops at the object's '}'
+ * and never reads on, so this finds that '}' as re does: the lines are flat (no value is an
+ * object or an array), and a quote opens a string only where a name or a value starts. An
+ * escaped NUL (a backslash, then u0000) is refused too: re decodes it to a NUL byte, where a
+ * C string would end.
+ */
+static bool one_object(const char *s, size_t len)
+{
+	bool quoted = false, esc = false;
+	char last = 0;   /* the last character outside a string, spaces aside */
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		const char c = s[i];
+
+		if (quoted) {
+			if (esc && c == 'u' && len - i > 4 && 0 == memcmp(s + i + 1, "0000", 4))
+				return false;
+			if (esc)
+				esc = false;
+			else if (c == '\\')
+				esc = true;
+			else if (c == '"')
+				quoted = false;
+			continue;
+		}
+
+		if (c == ' ' || c == '\t' || c == '\r')
+			continue;
+		if (last ? (c == '{' || c == '[') : c != '{')
+			return false;
+		if (c == '"' && last != '{' && last != ',' && last != ':')
+			return false;
+		if (c == '}')
+			break;
+
+		quoted = c == '"';
+		last = c;
+	}
+
+	if (i == len)
+		return false;
+
+	while (++i < len) {
+		if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r')
 			return false;
 	}
 
@@ -749,8 +822,21 @@ static void quit_all(const char *why)
 }
 
 
+/** Standard output broke: quits from the main loop, outside every call event */
+static void quit_broken(void *arg)
+{
+	(void)arg;
+
+	quit_all("Consort's end of the control channel is gone");
+}
+
+
 static void broken(const char *why)
 {
+	/* main.c exits with 1 for a rule broken, unless the line was quitting already */
+	if (!g.quitting)
+		g.code = 1;
+
 	consort_line_failed(why);
 	quit_all(why);
 }
@@ -785,7 +871,7 @@ static void command(const char *line, size_t len)
 	uint64_t id = 0;
 	int err;
 
-	err = json_decode_odict(&od, 8, line, len, 2);
+	err = one_object(line, len) ? json_decode_odict(&od, 8, line, len, 2) : EBADMSG;
 	if (err) {
 		broken("a command that isn't JSON");
 		goto out;
@@ -894,12 +980,15 @@ static void posted(void *arg)
 		switch (p->kind) {
 
 		case POST_LINE:
-			if (!g.quitting)
+			/* Not once standard output broke: the line is quitting */
+			if (!g.quitting && !g.broken)
 				command(p->line, str_len(p->line));
 			break;
 
 		case POST_TOO_LONG:
-			broken("a control line past 4,096 bytes");
+			/* As a line: not once the line is quitting, or standard output broke */
+			if (!g.quitting && !g.broken)
+				broken("a control line past 4,096 bytes");
 			break;
 
 		case POST_EOF:
@@ -950,6 +1039,10 @@ static DWORD WINAPI reader(LPVOID arg)
 			if (have && line[have - 1] == '\r')
 				--have;
 			line[have] = '\0';
+
+			/* A NUL is never in JSON: the line is refused, never read cut short */
+			if (memchr(line, '\0', have))
+				line[0] = '\0';
 
 			if (g.nlines < 2) {
 				g.lines[g.nlines] = line;
@@ -1002,11 +1095,12 @@ static DWORD WINAPI reader(LPVOID arg)
 }
 
 
-/** Waits for the n-th first line (1 or 2): it, or NULL when it didn't come in time */
-static const char *first_line(LONG n)
+/**
+ * Waits for the n-th first line (1 or 2), due 10 s after start (both lines share the one
+ * deadline): it, or NULL when it didn't come in time
+ */
+static const char *first_line(LONG n, DWORD start)
 {
-	const DWORD start = GetTickCount();
-
 	for (;;) {
 		DWORD spent;
 
@@ -1038,11 +1132,13 @@ static int take_secret(const char *line)
 {
 	static const char *const keys[] = {"line", "secret"};
 	struct odict *od = NULL;
-	const struct odict_entry *v, *e;
+	const struct odict_entry *v;
 	const char *hex;
+	struct le *le;
 	int err = EINVAL;
 
-	if (!line || json_decode_odict(&od, 4, line, str_len(line), 2))
+	if (!line || !one_object(line, str_len(line)) ||
+	    json_decode_odict(&od, 4, line, str_len(line), 2))
 		goto out;
 
 	v = odict_lookup(od, "line");
@@ -1055,11 +1151,15 @@ static int take_secret(const char *line)
 		err = 0;
 
  out:
-	/* The decoded copy of the secret's text is in od: wipe it before it is freed */
-	e = od ? odict_lookup(od, "secret") : NULL;
-	if (e && odict_entry_type(e) == ODICT_STRING) {
-		char *s = odict_entry_str(e);
-		cl_wipe(s, str_len(s));
+	/* The decoded copies of the line's text are in od (every "secret", should one come
+	 * twice): wipe them before they are freed */
+	for (le = od ? list_head(&od->lst) : NULL; le; le = le->next) {
+		const struct odict_entry *e = le->data;
+
+		if (odict_entry_type(e) == ODICT_STRING) {
+			char *s = odict_entry_str(e);
+			cl_wipe(s, str_len(s));
+		}
 	}
 	mem_deref(od);
 
@@ -1116,7 +1216,8 @@ static int take_settings(const char *line)
 	const char *listen, *account;
 	int err = EINVAL;
 
-	if (!line || json_decode_odict(&od, 4, line, str_len(line), 2))
+	if (!line || !one_object(line, str_len(line)) ||
+	    json_decode_odict(&od, 4, line, str_len(line), 2))
 		goto out;
 
 	listen = odict_string(od, "listen");
@@ -1141,6 +1242,7 @@ static int take_settings(const char *line)
 
 int consort_line_open(void)
 {
+	const DWORD start = GetTickCount();   /* both first lines are due 10 s from here */
 	int err;
 
 	/* Standard output is the add-on's from the first byte: baresip's log goes elsewhere */
@@ -1152,25 +1254,26 @@ int consort_line_open(void)
 	InitializeSRWLock(&g.lock);
 	g.got = CreateEventW(NULL, TRUE, FALSE, NULL);
 	g.ready = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (!g.got || !g.ready)
+	if (g.got && g.ready)
+		g.reader = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+	if (!g.reader) {
+		/* No fault of the first lines: main.c exits with 1, not 2 */
+		consort_line_failed("the line couldn't start");
 		return ENOMEM;
+	}
 
-	g.reader = CreateThread(NULL, 0, reader, NULL, 0, NULL);
-	if (!g.reader)
-		return ENOMEM;
-
-	err = take_secret(first_line(1));
+	err = take_secret(first_line(1, start));
 	wipe_line(0);
 	if (err) {
 		consort_line_failed("secret");
-		return err;
+		return EBADMSG;
 	}
 
-	err = take_settings(first_line(2));
+	err = take_settings(first_line(2, start));
 	wipe_line(1);
 	if (err) {
 		consort_line_failed("settings");
-		return err;
+		return EBADMSG;
 	}
 
 	return 0;
@@ -1195,18 +1298,23 @@ uint32_t consort_line_calls(void)
 }
 
 
-static void hello(void *arg)
+int consort_line_code(void)
+{
+	return g.code;
+}
+
+
+int consort_line_hello(void)
 {
 	struct sa laddr;
 	char sip[64] = "";
 	struct odict *od = NULL;
-	(void)arg;
 
 	if (0 == sip_transp_laddr(uag_sip(), &laddr, SIP_TRANSP_UDP, NULL))
 		(void)re_snprintf(sip, sizeof(sip), "%J", &laddr);
 
 	if (odict_alloc(&od, 8))
-		return;
+		return ENOMEM;
 
 	(void)odict_entry_add(od, "event", ODICT_STRING, "hello");
 	(void)odict_entry_add(od, "version", ODICT_STRING, CONSORT_LINE_VERSION);
@@ -1214,6 +1322,8 @@ static void hello(void *arg)
 	(void)odict_entry_add(od, "sip", ODICT_STRING, sip);
 	write_line(od);
 	mem_deref(od);
+
+	return g.broken ? EPIPE : 0;
 }
 
 
@@ -1231,9 +1341,9 @@ static int module_init(void)
 	if (err)
 		return err;
 
-	/* Lines past the first two may be taken now */
+	/* Lines past the first two may be read now. They are taken only inside re_main, so
+	 * after hello, which main.c writes just before it */
 	SetEvent(g.ready);
-	tmr_start(&g.hello, 0, hello, NULL);
 
 	return 0;
 }
@@ -1243,7 +1353,7 @@ static int module_close(void)
 {
 	bool reader_gone = true;
 
-	tmr_cancel(&g.hello);
+	tmr_cancel(&g.quit);
 	bevent_unregister(event_handler);
 
 	/* Every link's thread stops here, so none can post again */

@@ -15,6 +15,8 @@ One program, `consort-line.exe`, with no arguments and no files:
 - It loads only two of baresip's modules: G.711 and the add-on.
 - Each answered call gets its own port on 127.0.0.1 and a fresh nonce. The program connects
   there and proves it holds the secret, and the line proves itself back.
+- It exits with 0 after `quit` or once the program closes its end of the channel, 2 when the
+  first two lines weren't right, and 1 when a later line breaks a rule or anything else fails.
 
 It doesn't use baresip's `ctrl_tcp`, which gives the line to whichever program connects to
 it last. [PROTOCOL.md](PROTOCOL.md) has the whole contract, and what it guards against.
@@ -35,7 +37,8 @@ as an app module, so `consort-line.exe` links libbaresip statically.
   - `main.c`: the program.
 - `test/unit.c`: the add-on without baresip, including the link over real sockets.
 - `test/call_test.py`: whole calls between the line and a far end (`test/caller.c`, never
-  released) on 127.0.0.1, including a round trip through an echo.
+  released) on 127.0.0.1, including a round trip through an echo, and the control channel's
+  rules and exit codes.
 
 ## Releases
 
