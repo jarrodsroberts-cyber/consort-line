@@ -98,6 +98,8 @@ class FarEnd:
             "net_interface\t\t127.0.0.1",
             "ausrc_srate\t\t8000", "auplay_srate\t\t8000",
             "ausrc_channels\t\t1", "auplay_channels\t\t1",
+            # With no menu loaded, baresip makes no call of an INVITE unless told to
+            "call_accept\t\tyes",
             "module\t\t\tg711.so",
             *lines]) + "\n", encoding="utf-8")
         self.log = open(folder / "stderr.txt", "wb")
@@ -336,6 +338,8 @@ def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path) -> None:
         marked = conn.next({MARK}, within=3.0)
         check(bool(marked) and marked[2] == (1).to_bytes(4, "big"),
               "MARK 1 comes back once its sentence has played")
+        # The MARK says the line handed the tone to baresip: give it time to reach the caller
+        time.sleep(1.5)
         for _ in range(25):
             conn.send(AUDIO, voice[:SAMPLES].tobytes())
         flushed_at = conn.send(FLUSH)
@@ -367,13 +371,26 @@ def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path) -> None:
             caller.stop()
 
     if heard_wav.exists():
-        with wave.open(str(heard_wav), "rb") as rec:
-            samples = array.array("h", rec.readframes(rec.getnframes()))
+        samples = wav_data(heard_wav)
         blocks = [samples[i:i + SAMPLES] for i in range(0, len(samples) - SAMPLES, SAMPLES)]
         tonal = sum(1 for b in blocks if dbfs(b) > -30 and power_at(b, 1000) > 0.5)
+        loudest = max((dbfs(b) for b in blocks), default=-120.0)
+        print(f"  the caller's recording: {len(samples) / RATE:.1f} s, "
+              f"loudest 20 ms at {loudest:.0f} dBFS")
         check(tonal >= 40, f"the caller heard Consort's 1 kHz ({tonal} frames)")
     else:
         check(False, "the caller's recording was written")
+
+
+def wav_data(path: Path) -> array.array:
+    """A WAV's samples from its data chunk, whatever its header says of the length (a far end
+    that is killed may leave the header unfinished)."""
+    raw = path.read_bytes()
+    at = raw.find(b"data")
+    if at < 0:
+        return array.array("h")
+    body = raw[at + 8:]
+    return array.array("h", body[:len(body) // 2 * 2])
 
 
 def a_call_placed_to_an_echo(line_exe: str, caller_exe: str, root: Path) -> None:
@@ -431,6 +448,68 @@ def a_call_placed_to_an_echo(line_exe: str, caller_exe: str, root: Path) -> None
     finally:
         line.stop()
         echo.stop()
+
+
+def bursts(sender: Conn, hearer: Conn, times: int = 10) -> list[float]:
+    """Seconds from a 60 ms burst sent on one call's connection to its first loud frame on the
+    other's: one way through the line's send path, RTP on 127.0.0.1, and its receive path."""
+    burst = tone(0.06, 1000, -10)
+    trips = []
+    for _ in range(times):
+        time.sleep(0.4)
+        while not hearer.frames.empty():
+            hearer.frames.get_nowait()
+        sent_at = sender.send(AUDIO, burst[:SAMPLES].tobytes())
+        sender.send(AUDIO, burst[SAMPLES:2 * SAMPLES].tobytes())
+        sender.send(AUDIO, burst[2 * SAMPLES:].tobytes())
+        ends = time.monotonic() + 2.0
+        while time.monotonic() < ends:
+            got = hearer.next({AUDIO}, within=0.5)
+            if not got or got[1] is None:
+                break
+            if dbfs(array.array("h", got[2])) > -30:
+                trips.append(got[0] - sent_at)
+                break
+    return sorted(trips)
+
+
+def two_lines(line_exe: str, caller_exe: str, root: Path) -> None:
+    print("Two lines, one calling the other: what the line adds, each way, on one clock")
+    a = Line(line_exe, root / "a")
+    b = Line(line_exe, root / "b")
+    try:
+        hello_of(a)
+        hello_b = hello_of(b)
+        b_sip = int(hello_b["sip"].rsplit(":", 1)[1])
+        placed = a.send(do="dial", to=f"sip:line@127.0.0.1:{b_sip}")
+        check(placed.get("ok") is True, f"line A places the call ({placed})")
+        incoming = b.wait({"incoming"})
+        check(incoming.get("event") == "incoming", "it rings on line B")
+        check(b.send(do="accept", call=incoming.get("call", "")).get("ok") is True,
+              "B's Consort accepts it")
+        answered_b, answered_a = b.wait({"answered"}), a.wait({"answered"})
+        check(answered_a.get("event") == answered_b.get("event") == "answered",
+              "answered on both lines")
+        if answered_a.get("event") != "answered" or answered_b.get("event") != "answered":
+            return
+        conn_a, conn_b = Conn(a.secret, answered_a), Conn(b.secret, answered_b)
+        check(conn_a.proved and conn_b.proved, "both calls' ends prove themselves")
+
+        for name, trips in (("A to B", bursts(conn_a, conn_b)), ("B to A", bursts(conn_b, conn_a))):
+            check(len(trips) >= 8, f"{name}: the burst came through {len(trips)} times of 10")
+            if trips:
+                print(f"  {name}: median {statistics.median(trips) * 1000:.0f} ms, "
+                      f"{trips[0] * 1000:.0f} to {trips[-1] * 1000:.0f} ms")
+
+        check(a.send(do="hangup", call=answered_a["call"]).get("ok") is True, "A hangs up")
+        check(a.wait({"closed"}).get("event") == "closed", "closed on A")
+        check(b.wait({"closed"}).get("event") == "closed", "and on B, which the far end left")
+        check(bool(conn_b.next({HANGUP}, within=5.0)), "B's Consort hears HANGUP")
+        conn_a.close()
+        conn_b.close()
+    finally:
+        a.stop()
+        b.stop()
 
 
 def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
@@ -498,7 +577,8 @@ def main(argv: list[str]) -> int:
     line_exe, caller_exe = (str(Path(p).resolve()) for p in argv)
     with tempfile.TemporaryDirectory(prefix="consort-line-") as made:
         root = Path(made)
-        for test in (a_call_that_rings_here, a_call_placed_to_an_echo, the_control_channel):
+        for test in (a_call_that_rings_here, a_call_placed_to_an_echo, two_lines,
+                     the_control_channel):
             folder = root / test.__name__
             folder.mkdir()
             before = len(FAILED)

@@ -21,7 +21,7 @@
 #include "consort.h"
 
 enum {
-	LINE_MAX      = 4096,   /**< A control line's bytes, at most         */
+	CHANNEL_LINE_MAX      = 4096,   /**< A control line's bytes, at most         */
 	FIRST_WAIT    = 10000,  /**< The first two lines within 10 s (ms)    */
 	ID_BYTES      = 8,      /**< A call's own id: 8 random bytes, as hex */
 	ID_MAX        = 2 * ID_BYTES,
@@ -926,7 +926,7 @@ static void posted(void *arg)
 static DWORD WINAPI reader(LPVOID arg)
 {
 	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-	char *line = malloc(LINE_MAX + 1);
+	char *line = malloc(CHANNEL_LINE_MAX + 1);
 	size_t have = 0;
 	bool skip = false;
 	(void)arg;
@@ -955,7 +955,7 @@ static DWORD WINAPI reader(LPVOID arg)
 				g.lines[g.nlines] = line;
 				InterlockedIncrement(&g.nlines);
 				SetEvent(g.got);
-				line = malloc(LINE_MAX + 1);
+				line = malloc(CHANNEL_LINE_MAX + 1);
 				if (!line)
 					break;
 				/* After the second, nothing until posts can be taken */
@@ -977,7 +977,7 @@ static DWORD WINAPI reader(LPVOID arg)
 		if (skip)
 			continue;
 
-		if (have >= LINE_MAX) {
+		if (have >= CHANNEL_LINE_MAX) {
 			if (g.nlines < 2)
 				break;
 			skip = true;
@@ -989,7 +989,7 @@ static DWORD WINAPI reader(LPVOID arg)
 
  out:
 	if (line) {
-		cl_wipe(line, LINE_MAX + 1);
+		cl_wipe(line, CHANNEL_LINE_MAX + 1);
 		free(line);
 	}
 
@@ -1026,7 +1026,7 @@ static const char *first_line(LONG n)
 static void wipe_line(unsigned n)
 {
 	if (g.lines[n]) {
-		cl_wipe(g.lines[n], LINE_MAX + 1);
+		cl_wipe(g.lines[n], CHANNEL_LINE_MAX + 1);
 		free(g.lines[n]);
 		g.lines[n] = NULL;
 	}
