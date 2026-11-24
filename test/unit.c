@@ -18,6 +18,10 @@
 #include "proof.h"
 #include "link.h"
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 static int checks, failures;
 
 #define CHECK(c) do {                                                         \
@@ -237,6 +241,8 @@ struct audio {
 	unsigned pushed;         /* frames the source took                     */
 	int16_t heard[256];      /* the first sample of each non-silent frame  */
 	unsigned nheard;
+	volatile LONG hold;      /* 1: the next pull stands the link's thread still */
+	HANDLE held, go;         /* it stands still; it may go on              */
 };
 
 static void source(const int16_t samples[CL_SAMPLES], void *arg)
@@ -254,6 +260,12 @@ static void source(const int16_t samples[CL_SAMPLES], void *arg)
 static void player_h(int16_t samples[CL_SAMPLES], void *arg)
 {
 	struct audio *a = arg;
+
+	/* A test can stand the link's thread still here, inside a tick, before a->lock */
+	if (InterlockedCompareExchange(&a->hold, 0, 1) == 1) {
+		SetEvent(a->held);
+		(void)WaitForSingleObject(a->go, 5000);
+	}
 
 	AcquireSRWLockExclusive(&a->lock);
 	++a->pulled;
@@ -281,7 +293,21 @@ static void on_ended(enum cl_end why, void *arg)
 
 static uint8_t secret[CL_SECRET_BYTES];
 
-static SOCKET dial(uint16_t port)
+static uint64_t now_us(void)
+{
+	LARGE_INTEGER freq, count;
+
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&count);
+
+	return (uint64_t)(count.QuadPart / freq.QuadPart) * 1000000u +
+		(uint64_t)(count.QuadPart % freq.QuadPart) * 1000000u /
+		(uint64_t)freq.QuadPart;
+}
+
+
+/** A connection to the line, with a receive buffer of rcvbuf bytes (0: Windows' own) */
+static SOCKET dial_with(uint16_t port, int rcvbuf)
 {
 	struct sockaddr_in sin;
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -295,12 +321,21 @@ static SOCKET dial(uint16_t port)
 
 	(void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&yes, sizeof(yes));
 	(void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
+	/* Before connecting, so the window the line sees is this small */
+	if (rcvbuf)
+		(void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 	if (connect(s, (struct sockaddr *)&sin, sizeof(sin))) {
 		closesocket(s);
 		return INVALID_SOCKET;
 	}
 
 	return s;
+}
+
+
+static SOCKET dial(uint16_t port)
+{
+	return dial_with(port, 0);
 }
 
 
@@ -406,6 +441,8 @@ static void call_start(struct call *c)
 {
 	memset(c, 0, sizeof(*c));
 	InitializeSRWLock(&c->audio.lock);
+	c->audio.held = CreateEventW(NULL, FALSE, FALSE, NULL);
+	c->audio.go = CreateEventW(NULL, FALSE, FALSE, NULL);
 	c->ending.ev = CreateEventW(NULL, TRUE, FALSE, NULL);
 	CHECK(0 == cl_link_alloc(&c->link, secret, on_ended, &c->ending));
 	cl_link_source(c->link, source, &c->audio);
@@ -419,6 +456,26 @@ static void call_end(struct call *c)
 	cl_link_player(c->link, NULL, NULL);
 	cl_link_free(c->link);
 	CloseHandle(c->ending.ev);
+	CloseHandle(c->audio.held);
+	CloseHandle(c->audio.go);
+}
+
+
+/** Stands the link's thread still inside its next tick (holding its lock) until let_go */
+static bool stand_still(struct call *c)
+{
+	InterlockedExchange(&c->audio.hold, 1);
+	if (WaitForSingleObject(c->audio.held, 2000) == WAIT_OBJECT_0)
+		return true;
+
+	InterlockedExchange(&c->audio.hold, 0);
+	return false;
+}
+
+
+static void let_go(struct call *c)
+{
+	SetEvent(c->audio.go);
 }
 
 
@@ -724,6 +781,483 @@ static void test_consorts_hangup_and_close_end_the_calls_audio(void)
 }
 
 
+static void test_consorts_connection_is_read_before_a_flood_pushes_it_out(void)
+{
+	struct call c;
+	uint8_t id[CL_ID_FRAME_BYTES], back[CL_ID_FRAME_BYTES], want[CL_ID_FRAME_BYTES];
+	SOCKET s, silent[15], later[10];
+	unsigned connected = 0;
+
+	call_start(&c);
+	CHECK(0 == cl_link_answer(c.link, &c.port, c.nonce));
+
+	/* Consort's connection is taken before its ID comes, then 15 that never send one:
+	 * 16 wait, the most the line keeps, and Consort's is the oldest */
+	s = dial(c.port);
+	CHECK(s != INVALID_SOCKET);
+	Sleep(50);
+	for (unsigned i = 0; i < 15; i++) {
+		silent[i] = dial(c.port);
+		Sleep(5);
+	}
+	Sleep(50);
+
+	/* With the link's thread stood still, Consort's ID comes, then 10 more connections:
+	 * the backlog takes them all */
+	CHECK(stand_still(&c));
+	consort_id(id, c.nonce, c.port, "consort");
+	CHECK(send_all(s, id, sizeof(id)));
+	for (unsigned i = 0; i < 10; i++) {
+		later[i] = dial(c.port);
+		if (later[i] != INVALID_SOCKET)
+			++connected;
+	}
+	CHECK(connected == 10);
+	let_go(&c);
+
+	/* The first of them makes room: the oldest is read before it goes, and proves itself */
+	CHECK(recv_all(s, back, sizeof(back)) == 1);
+	consort_id(want, c.nonce, c.port, "line");
+	CHECK(memcmp(back, want, sizeof(want)) == 0);
+	CHECK(cl_link_proved(c.link));
+
+	for (unsigned i = 0; i < 15; i++) {
+		if (silent[i] != INVALID_SOCKET)
+			closesocket(silent[i]);
+	}
+	for (unsigned i = 0; i < 10; i++) {
+		if (later[i] != INVALID_SOCKET)
+			closesocket(later[i]);
+	}
+	closesocket(s);
+	call_end(&c);
+}
+
+
+struct flood {
+	uint16_t port;
+	volatile LONG stop;
+	volatile LONG made;
+};
+
+/** Connects again and again: each until the line closes it, then a reset (no TIME_WAIT) */
+static DWORD WINAPI flooder(LPVOID arg)
+{
+	struct flood *f = arg;
+	struct linger abort_close;
+	char buf[64];
+
+	abort_close.l_onoff = 1;
+	abort_close.l_linger = 0;
+
+	while (!f->stop) {
+		SOCKET s = dial(f->port);
+
+		if (s == INVALID_SOCKET) {
+			Sleep(1);
+			continue;
+		}
+		InterlockedIncrement(&f->made);
+		while (recv(s, buf, sizeof(buf), 0) > 0) {
+			/* until the line closes it */
+		}
+		(void)setsockopt(s, SOL_SOCKET, SO_LINGER, (const char *)&abort_close,
+				 sizeof(abort_close));
+		closesocket(s);
+	}
+
+	return 0;
+}
+
+
+static DWORD WINAPI ender(LPVOID arg)
+{
+	call_end(arg);
+
+	return 0;
+}
+
+
+static void test_a_flood_of_connections_stops_neither_the_tick_nor_the_link(void)
+{
+	static struct flood f;   /* not on the stack: a flooder may outlive its wait */
+	struct call c;
+	HANDLE threads[8], done;
+	uint8_t payload[CL_AUDIO_BYTES], type;
+	uint16_t len;
+	unsigned frames = 0, started = 0;
+	DWORD start;
+	SOCKET s;
+
+	call_start(&c);
+	CHECK(0 == cl_link_answer(c.link, &c.port, c.nonce));
+	s = prove(&c);
+
+	memset(&f, 0, sizeof(f));
+	f.port = c.port;
+	for (unsigned i = 0; i < 8; i++) {
+		threads[i] = CreateThread(NULL, 0, flooder, &f, 0, NULL);
+		if (threads[i])
+			++started;
+	}
+	CHECK(started == 8);
+	Sleep(100);
+
+	/* The caller's audio still comes, a frame each 20 ms */
+	start = GetTickCount();
+	while (GetTickCount() - start < 1500) {
+		if (read_frame(s, &type, payload, &len) != 1)
+			break;
+		if (type == CL_AUDIO)
+			++frames;
+	}
+	CHECK(frames >= 50);
+
+	/* And the link stops at once, flood or not: hanging a call up never waits on it */
+	done = CreateThread(NULL, 0, ender, &c, 0, NULL);
+	CHECK(done != NULL);
+	if (done)
+		CHECK(WaitForSingleObject(done, 1000) == WAIT_OBJECT_0);
+
+	/* Each flooder ends after its connect (a refused one takes Windows about 2 s) or recv */
+	InterlockedExchange(&f.stop, 1);
+	for (unsigned i = 0; i < 8; i++) {
+		if (threads[i]) {
+			(void)WaitForSingleObject(threads[i], 30000);
+			CloseHandle(threads[i]);
+		}
+	}
+	if (done) {
+		(void)WaitForSingleObject(done, INFINITE);
+		CloseHandle(done);
+	}
+	else {
+		call_end(&c);
+	}
+	printf("  a flood of %ld connections: %u frames came in 1.5 s\n", f.made, frames);
+
+	closesocket(s);
+}
+
+
+static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_fill(void)
+{
+	struct call c;
+	uint8_t id[CL_ID_FRAME_BYTES], back[CL_ID_FRAME_BYTES], want[CL_ID_FRAME_BYTES];
+	uint8_t payload[CL_AUDIO_BYTES], type;
+	uint16_t len;
+	unsigned audio = 0;
+	DWORD start, spent;
+	bool ended;
+	SOCKET s;
+
+	call_start(&c);
+	CHECK(0 == cl_link_answer(c.link, &c.port, c.nonce));
+
+	/* As PROTOCOL.md asks: a receive buffer of 4,096 bytes, set before connecting */
+	s = dial_with(c.port, 4096);
+	CHECK(s != INVALID_SOCKET);
+	consort_id(id, c.nonce, c.port, "consort");
+	CHECK(send_all(s, id, sizeof(id)));
+	CHECK(recv_all(s, back, sizeof(back)) == 1);
+	consort_id(want, c.nonce, c.port, "line");
+	CHECK(memcmp(back, want, sizeof(want)) == 0);
+
+	/* Nothing is read from here: the 2 s count once both sockets are full, whatever share
+	 * Windows gives them. This checks the 2 s, not the line's 2 KB send buffer: without it,
+	 * Windows 11's sockets take about 222 frames, and the call still ends inside these bounds */
+	start = GetTickCount();
+	ended = WaitForSingleObject(c.ending.ev, 12000) == WAIT_OBJECT_0;
+	spent = GetTickCount() - start;
+	CHECK(ended && c.ending.why == CL_END_NOT_TAKEN);
+
+	/* What the two sockets held. Windows 11 holds 26 frames there; Windows Server's share
+	 * grows over a call (7 to 97 measured), so the test reads it rather than assume it */
+	if (ended) {
+		while (read_frame(s, &type, payload, &len) == 1) {
+			if (type == CL_AUDIO)
+				++audio;
+		}
+	}
+
+	/* A frame each 20 ms, and the call ended 2 s after the last one the sockets took: never
+	 * sooner, never from later, and none of the line's own queue came after them (that would
+	 * be a frame for every 20 ms of the wait) */
+	CHECK(spent + 500 >= 2000 + 20 * audio);
+	CHECK(spent <= 2000 + 20 * audio + 1000);
+	printf("  frames not taken: the call ended after %lu ms, with %u frames left to read\n",
+	       (unsigned long)spent, audio);
+
+	closesocket(s);
+	call_end(&c);
+}
+
+
+/**
+ * Consort speaking while it is behind in reading: a frame of its audio each 20 ms or more,
+ * until told to stop. Told to break a rule, it sends a DTMF frame first (a type Consort
+ * doesn't send, with a payload the line leaves unread), then goes on speaking.
+ */
+struct talker {
+	SOCKET s;
+	volatile LONG stop;
+	volatile LONG breaks;
+};
+
+static DWORD WINAPI talk(LPVOID arg)
+{
+	struct talker *t = arg;
+	uint8_t payload[CL_AUDIO_BYTES];
+	const uint8_t key = '5';
+
+	audio_of(payload, 7);
+	while (!t->stop) {
+		if (InterlockedExchange(&t->breaks, 0) == 1 && !send_frame(t->s, CL_DTMF, &key, 1))
+			break;
+		if (!send_frame(t->s, CL_AUDIO, payload, CL_AUDIO_BYTES))
+			break;
+		Sleep(20);
+	}
+
+	return 0;
+}
+
+
+/**
+ * The call ends while Consort is behind in reading: the far end hangs up, or Consort breaks a
+ * rule. Every frame that waited for Consort still comes, in order, then HANGUP or ERROR 2,
+ * then the end, never a reset: also when Consort keeps speaking, and when the frame that
+ * broke the rule has a payload the line never reads (a socket closed with bytes unread, or
+ * that bytes reach once it is closed, resets on Windows). Consort reads nothing for 1.5 s (a
+ * 4 KB receive buffer), past what the two sockets take on Windows 11 (26 frames) and inside
+ * the 2 s the line gives Consort once they are full, however soon that is. The stand-in
+ * player numbers its frames 1, 2, 3, so a frame missing shows.
+ */
+static void ends_while_consort_is_behind(bool far_end, bool talking)
+{
+	const char *how = far_end ? "the far end hangs up" : "a rule broken";
+	struct call c;
+	struct talker t;
+	uint8_t id[CL_ID_FRAME_BYTES], back[CL_ID_FRAME_BYTES], want[CL_ID_FRAME_BYTES];
+	uint8_t payload[CL_AUDIO_BYTES], type, last = 0, code = 0;
+	const uint8_t key = '5';
+	uint16_t len;
+	unsigned audio = 0, gaps = 0;
+	int16_t v, prev = 0, pulled;
+	HANDLE th = NULL;
+	DWORD ended_at, spent;
+	int r;
+	SOCKET s;
+
+	call_start(&c);
+	CHECK(0 == cl_link_answer(c.link, &c.port, c.nonce));
+	s = dial_with(c.port, 4096);
+	CHECK(s != INVALID_SOCKET);
+	consort_id(id, c.nonce, c.port, "consort");
+	CHECK(send_all(s, id, sizeof(id)));
+	CHECK(recv_all(s, back, sizeof(back)) == 1);
+	consort_id(want, c.nonce, c.port, "line");
+	CHECK(memcmp(back, want, sizeof(want)) == 0);
+
+	memset(&t, 0, sizeof(t));
+	t.s = s;
+	if (talking) {
+		th = CreateThread(NULL, 0, talk, &t, 0, NULL);
+		CHECK(th != NULL);
+	}
+
+	Sleep(1500);
+	if (far_end)
+		cl_link_hangup(c.link);
+	else if (th)
+		InterlockedExchange(&t.breaks, 1);
+	else
+		CHECK(send_frame(s, CL_DTMF, &key, 1));
+	ended_at = GetTickCount();
+
+	/* Speaking, Consort goes on unread a while: its frames reach the line's socket after the
+	 * line's last frame, whatever the clock's ticks, as a busy Consort's do */
+	if (th)
+		Sleep(200);
+
+	while ((r = read_frame(s, &type, payload, &len)) == 1) {
+		last = type;
+		if (type == CL_ERROR && len == 1)
+			code = payload[0];
+		if (type != CL_AUDIO)
+			continue;
+
+		v = (int16_t)(payload[0] | (payload[1] << 8));
+		if (audio && v != (int16_t)(prev + 1))
+			++gaps;
+		prev = v;
+		++audio;
+	}
+
+	/* The end came soon after the last frame: the line shut its end at once (it would come
+	 * only after the 2 s without the shutdown) */
+	spent = GetTickCount() - ended_at;
+	CHECK(spent < 1000);
+
+	if (th) {
+		InterlockedExchange(&t.stop, 1);
+		CHECK(WaitForSingleObject(th, 3000) == WAIT_OBJECT_0);
+		CloseHandle(th);
+	}
+
+	AcquireSRWLockExclusive(&c.audio.lock);
+	pulled = c.audio.pulled;
+	ReleaseSRWLockExclusive(&c.audio.lock);
+
+	CHECK(r == 0);                        /* the line's end came: not a reset, nor a timeout */
+	CHECK(last == (far_end ? CL_HANGUP : CL_ERROR));
+	CHECK(far_end || code == CL_ERR_FRAME);
+	CHECK(gaps == 0 && audio >= 50);      /* about 75: 1.5 s of frames */
+	CHECK(prev == pulled);                /* the last frame the line pulled came too */
+	printf("  %s with Consort behind%s: %u frames, then 0x%02x and the end (%d), %lu ms "
+	       "from the hang-up or the rule broken\n", how, talking ? " and speaking" : "",
+	       audio, last, r, (unsigned long)spent);
+
+	closesocket(s);
+	call_end(&c);
+}
+
+
+static void test_the_last_frames_reach_a_consort_that_is_behind(void)
+{
+	ends_while_consort_is_behind(true, false);
+	ends_while_consort_is_behind(false, false);
+	ends_while_consort_is_behind(true, true);
+	ends_while_consort_is_behind(false, true);
+}
+
+
+/**
+ * Stands in for baresip's sender: each 20 ms it takes one frame of what the source was handed,
+ * when one is waiting (on its first read all but one are dropped, as aubuf does), and keeps
+ * the fewest frames left waiting after a read in each phase of the test.
+ */
+struct sender {
+	struct audio *a;
+	volatile LONG stop;
+	volatile LONG phase;     /* 0 before the hold, 1 just after, 2 the last 300 ms */
+	unsigned fewest[3];
+};
+
+static DWORD WINAPI sender_thread(LPVOID arg)
+{
+	struct sender *t = arg;
+	HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+					      TIMER_ALL_ACCESS);
+	uint64_t next = now_us() + 20000;
+	unsigned taken = 0;
+	bool started = false;
+
+	if (!timer)
+		timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+	if (!timer)
+		return 1;
+
+	while (!t->stop) {
+		const uint64_t now = now_us();
+		LARGE_INTEGER due;
+		unsigned pushed, left;
+		LONG phase;
+
+		due.QuadPart = next > now ? -(LONGLONG)((next - now) * 10) : -1;
+		(void)SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+		(void)WaitForSingleObject(timer, 1000);
+		next += 20000;
+
+		AcquireSRWLockExclusive(&t->a->lock);
+		pushed = t->a->pushed;
+		ReleaseSRWLockExclusive(&t->a->lock);
+
+		if (!pushed)
+			continue;
+		if (!started) {
+			taken = pushed - 1;
+			started = true;
+		}
+		if (pushed > taken)
+			++taken;
+		left = pushed - taken;
+
+		phase = t->phase;
+		if (phase >= 0 && phase < 3 && left < t->fewest[phase])
+			t->fewest[phase] = left;
+	}
+
+	CloseHandle(timer);
+
+	return 0;
+}
+
+
+static void test_a_late_tick_leaves_baresip_no_backlog(void)
+{
+	struct call c;
+	struct sender t;
+	uint8_t payload[CL_AUDIO_BYTES];
+	bool in_order = true;
+	uint64_t from;
+	HANDLE th;
+	SOCKET s;
+
+	call_start(&c);
+	CHECK(0 == cl_link_answer(c.link, &c.port, c.nonce));
+	s = prove(&c);
+
+	memset(&t, 0, sizeof(t));
+	t.a = &c.audio;
+	t.fewest[0] = t.fewest[1] = t.fewest[2] = ~0u;
+	th = CreateThread(NULL, 0, sender_thread, &t, 0, NULL);
+	CHECK(th != NULL);
+	Sleep(300);
+
+	/* Ten of Consort's frames, then the link's thread stands still for 90 ms: it catches
+	 * up on the ticks it missed after, but hands baresip only the one for now */
+	for (int16_t v = 3000; v < 3010; v++) {
+		audio_of(payload, v);
+		CHECK(send_frame(s, CL_AUDIO, payload, CL_AUDIO_BYTES));
+	}
+	InterlockedExchange(&t.phase, 1);
+	CHECK(stand_still(&c));
+	from = now_us();
+	while (now_us() - from < 90000)
+		YieldProcessor();
+	let_go(&c);
+
+	Sleep(100);
+	InterlockedExchange(&t.phase, 2);
+	Sleep(300);
+	/* It reads c.audio, on this stack: wait it out (each of its waits is 1 s at most) */
+	InterlockedExchange(&t.stop, 1);
+	if (th) {
+		(void)WaitForSingleObject(th, INFINITE);
+		CloseHandle(th);
+	}
+
+	/* baresip's buffer as before, near empty: not 4 or 5 frames behind for the rest of
+	 * the call */
+	CHECK(t.fewest[0] <= 1);
+	CHECK(t.fewest[2] <= 2);
+	printf("  frames waiting in the sender's buffer: %u before a 90 ms stall, %u after\n",
+	       t.fewest[0], t.fewest[2]);
+
+	/* Consort's frames were held back, never dropped */
+	AcquireSRWLockExclusive(&c.audio.lock);
+	CHECK(c.audio.nheard == 10);
+	for (unsigned i = 0; i < c.audio.nheard && i < 10; i++)
+		in_order = in_order && c.audio.heard[i] == (int16_t)(3000 + i);
+	ReleaseSRWLockExclusive(&c.audio.lock);
+	CHECK(in_order);
+
+	closesocket(s);
+	call_end(&c);
+}
+
+
 int main(void)
 {
 	WSADATA wsa;
@@ -745,6 +1279,11 @@ int main(void)
 	test_no_right_id_within_2_seconds_ends_the_calls_audio();
 	test_a_frame_that_breaks_a_rule_is_error_2();
 	test_consorts_hangup_and_close_end_the_calls_audio();
+	test_consorts_connection_is_read_before_a_flood_pushes_it_out();
+	test_a_flood_of_connections_stops_neither_the_tick_nor_the_link();
+	test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_fill();
+	test_the_last_frames_reach_a_consort_that_is_behind();
+	test_a_late_tick_leaves_baresip_no_backlog();
 
 	WSACleanup();
 	printf("%d checks, %d failed\n", checks, failures);

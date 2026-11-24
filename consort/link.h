@@ -84,4 +84,11 @@ bool cl_link_proved(struct cl_link *l);
 /** The link's figures so far */
 void cl_link_stats(struct cl_link *l, struct cl_link_stats *stats);
 
+/**
+ * Waits, 2 s at most, for the connections still closing after the line's HANGUP or ERROR
+ * (each reads what Consort still sends until Consort closes its end): the line's exit would
+ * reset them. Called once every link is freed, so none can start another.
+ */
+void cl_link_settle(void);
+
 #endif

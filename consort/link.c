@@ -35,7 +35,11 @@ enum {
 	LATE_US     = 2000,     /**< A tick this late or later counts as late   */
 	RESTART_US  = 100000,   /**< Later than this, the clock starts again    */
 	MAX_PENDING = 16,       /**< Connections waiting to prove themselves    */
+	MAX_ACCEPTS = 8,        /**< Connections taken a pass, at most          */
 	OUT_BYTES   = 65536,    /**< The line's frames waiting for Consort      */
+	SEND_BUFFER = 2048,     /**< The kernel's share of them: a few frames   */
+	LAST_BUFFER = 1 << 20,  /**< The kernel's room once the last frame comes: all of them */
+	LINGER_US   = 2000000,  /**< After it, Consort's bytes are read until it closes, or this */
 	MAX_KEYS    = 32,
 };
 
@@ -152,6 +156,104 @@ static bool flush_out(struct cl_link *l)
 }
 
 
+/**
+ * The last of the line's frames (HANGUP or ERROR, after what waited for Consort): the
+ * kernel is given room for all of it, as the small send buffer could leave it in the
+ * line's own queue, which goes when the connection closes. The room is generous: Windows
+ * Server's share moves over a call, and a raise to just the queue's size left frames behind
+ * there. The close is graceful, so the kernel still sends what it holds, then the end.
+ */
+static void flush_last(struct cl_link *l)
+{
+	const int room = LAST_BUFFER;
+
+	if (!l->outlen || l->conn == INVALID_SOCKET)
+		return;
+
+	(void)setsockopt(l->conn, SOL_SOCKET, SO_SNDBUF, (const char *)&room, sizeof(room));
+	(void)flush_out(l);
+}
+
+
+/** Closers still draining: the line's exit waits for them (cl_link_settle) */
+static volatile LONG closers;
+
+
+/** The closer's thread: Consort's bytes read and dropped until it closes, or LINGER_US */
+static DWORD WINAPI drain_close(LPVOID arg)
+{
+	const SOCKET s = (SOCKET)(UINT_PTR)arg;
+	const uint64_t until = now_us() + LINGER_US;
+	char sink[1024];
+
+	while (now_us() < until) {
+		struct timeval tv = {0, 100000};   /* the limit is looked at every 100 ms */
+		fd_set readable;
+		int n;
+
+		FD_ZERO(&readable);
+		FD_SET(s, &readable);
+		n = select(0, &readable, NULL, NULL, &tv);
+		if (n == SOCKET_ERROR)
+			break;
+		if (n == 0)
+			continue;
+
+		n = recv(s, sink, (int)sizeof(sink), 0);
+		if (n == 0 || (n == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK))
+			break;
+	}
+
+	(void)closesocket(s);
+	(void)InterlockedDecrement(&closers);
+
+	return 0;
+}
+
+
+/**
+ * Closes Consort's connection after the line's last frame (HANGUP or ERROR) without losing
+ * what waits for Consort. On Windows a socket closed with Consort's bytes unread, or that
+ * Consort's bytes reach once it is closed, ends in a reset, which drops every frame Consort
+ * hasn't read: the usual case for a Consort that is behind and still speaking. So the line's
+ * end is shut, and a thread of its own reads what Consort still sends until Consort closes
+ * its end, or for LINGER_US, before the socket goes. Neither the link nor baresip waits for
+ * it. With no thread to be had, close_all closes the socket at once, as before.
+ */
+static void close_last(struct cl_link *l)
+{
+	HANDLE t = NULL;
+
+	if (l->conn == INVALID_SOCKET)
+		return;
+
+	(void)shutdown(l->conn, SD_SEND);
+
+	/* Off the event the link's sockets share, which goes with the link */
+	if (0 == WSAEventSelect(l->conn, NULL, 0)) {
+		(void)InterlockedIncrement(&closers);
+		t = CreateThread(NULL, 0, drain_close, (LPVOID)(UINT_PTR)l->conn, 0, NULL);
+		if (!t)
+			(void)InterlockedDecrement(&closers);
+	}
+	if (!t)
+		return;
+
+	CloseHandle(t);
+	l->conn = INVALID_SOCKET;   /* the closer's now */
+}
+
+
+void cl_link_settle(void)
+{
+	/* A closer looks at its limit every 100 ms, so it may end a little after its 2 s */
+	const uint64_t until = now_us() + LINGER_US + 200000;
+
+	while (InterlockedCompareExchange(&closers, 0, 0) > 0 && now_us() < until)
+		Sleep(10);
+}
+
+
 static void end(struct cl_link *l, enum cl_end why)
 {
 	if (l->ended)
@@ -169,6 +271,8 @@ static void end(struct cl_link *l, enum cl_end why)
 			memcpy(l->out + l->outlen, frame, n);
 			l->outlen += n;
 			(void)flush_out(l);
+			flush_last(l);
+			close_last(l);
 		}
 	}
 
@@ -313,6 +417,7 @@ static void refuse(struct cl_link *l, struct pending *p)
 /** Consort's ID checked out on this connection: it is the call's, and the line proves itself */
 static void become_consort(struct cl_link *l, struct pending *p)
 {
+	const int sndbuf = SEND_BUFFER;
 	BOOL yes = TRUE;
 
 	l->conn = p->s;
@@ -324,6 +429,9 @@ static void become_consort(struct cl_link *l, struct pending *p)
 	}
 
 	(void)setsockopt(l->conn, IPPROTO_TCP, TCP_NODELAY, (const char *)&yes, sizeof(yes));
+	/* A small send buffer: frames Consort doesn't take soon wait in the line's own queue,
+	 * where the 2 s it has to take them are counted */
+	(void)setsockopt(l->conn, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
 	if (WSAEventSelect(l->conn, l->sockev, FD_READ | FD_WRITE | FD_CLOSE)) {
 		end(l, CL_END_FAILED);
 		return;
@@ -378,7 +486,11 @@ static bool read_id(struct cl_link *l, struct pending *p)
 static void compact_pending(struct cl_link *l);
 
 
-/** Makes room for one more waiting connection: the oldest goes, so a flood can't crowd out Consort's */
+/**
+ * Makes room for one more waiting connection: the oldest goes, so a flood can't crowd out
+ * Consort's. Its ID may have come since it was taken, so it is read first: Consort's
+ * connection proves itself there rather than going unread.
+ */
 static void make_room(struct cl_link *l)
 {
 	unsigned oldest = 0;
@@ -391,19 +503,25 @@ static void make_room(struct cl_link *l)
 		if (l->pending[i].since < l->pending[oldest].since)
 			oldest = i;
 	}
-	refuse(l, &l->pending[oldest]);
+	if (read_id(l, &l->pending[oldest]))
+		refuse(l, &l->pending[oldest]);
 	compact_pending(l);
 }
 
 
-static void accept_all(struct cl_link *l)
+/**
+ * Takes the connections waiting, MAX_ACCEPTS at most, so a flood can't hold the thread
+ * here: each pass still reads stop and runs the tick and the deadlines. True when more may
+ * be waiting.
+ */
+static bool accept_some(struct cl_link *l)
 {
-	for (;;) {
+	for (unsigned n = 0; n < MAX_ACCEPTS; n++) {
 		SOCKET s = accept(l->listener, NULL, NULL);
 		struct pending *p;
 
 		if (s == INVALID_SOCKET)
-			return;
+			return false;
 
 		(void)SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
 
@@ -424,11 +542,13 @@ static void accept_all(struct cl_link *l)
 		p->since = now_us();
 		p->have = 0;
 
-		/* It may have sent its ID already */
+		/* It may have sent its ID already. Once it proved itself, the rest are closed */
 		(void)read_id(l, p);
-		if (l->proved || l->ended)
-			return;
+		if (l->ended)
+			return false;
 	}
+
+	return true;
 }
 
 
@@ -447,11 +567,12 @@ static void compact_pending(struct cl_link *l)
 static void network(struct cl_link *l)
 {
 	WSANETWORKEVENTS ne;
+	bool more = false;
 
 	if (l->listening && l->listener != INVALID_SOCKET &&
 	    0 == WSAEnumNetworkEvents(l->listener, l->sockev, &ne) &&
 	    (ne.lNetworkEvents & FD_ACCEPT))
-		accept_all(l);
+		more = accept_some(l);
 
 	for (unsigned i = 0; i < l->npending && !l->proved && !l->ended; i++) {
 		struct pending *p = &l->pending[i];
@@ -474,29 +595,42 @@ static void network(struct cl_link *l)
 		if (!l->ended && (ne.lNetworkEvents & FD_CLOSE))
 			end(l, CL_END_CLOSED);
 	}
+
+	/* The listener's FD_ACCEPT stays recorded, but the calls above reset the event the
+	 * sockets share: set it again, so the rest are taken on the next pass, not a tick on */
+	if (more && !l->ended)
+		(void)WSASetEvent(l->sockev);
 }
 
 
-static void tick(struct cl_link *l)
+/**
+ * One tick: the caller's next 20 ms to Consort, and with feed, Consort's next 20 ms (or
+ * silence) to baresip's source. Ticks that catch up feed nothing: baresip's sender has let
+ * those 20 ms go already, and frames handed it for them at once would wait in its buffer for
+ * the rest of the call. Consort's frames wait in the player instead, where FLUSH and the
+ * MARKs still reach them.
+ */
+static void tick(struct cl_link *l, bool feed)
 {
 	int16_t caller[CL_SAMPLES], voice[CL_SAMPLES];
 	const bool mid = l->player.since > 0 && !l->flushed;
-	bool heard = false, played;
+	bool heard = false, played = false;
 
-	played = cl_player_play(&l->player, voice);
+	if (feed)
+		played = cl_player_play(&l->player, voice);
 
 	AcquireSRWLockExclusive(&l->lock);
 	if (l->playh) {
 		l->playh(caller, l->playarg);
 		heard = true;
 	}
-	if (l->srch)
+	if (feed && l->srch)
 		l->srch(voice, l->srcarg);
 
 	++l->stats.ticks;
 	if (played)
 		++l->stats.played;
-	else if (mid)
+	else if (feed && mid)
 		++l->stats.dry;
 	if (l->player.count > l->stats.most_queued)
 		l->stats.most_queued = l->player.count;
@@ -542,7 +676,8 @@ static void ticks(struct cl_link *l, uint64_t *next, uint64_t now)
 			l->stats.latest_us = (uint32_t)late;
 		ReleaseSRWLockExclusive(&l->lock);
 
-		tick(l);
+		/* Only the tick for the 20 ms now running feeds baresip's source */
+		tick(l, late < TICK_US);
 		*next += TICK_US;
 	}
 }
@@ -636,9 +771,13 @@ static DWORD WINAPI run(LPVOID arg)
 		}
 
 		if (hangup && !l->ended) {
-			/* The far end hung up: HANGUP, then nothing more */
+			/* The far end hung up: what waited for Consort, HANGUP, then nothing more */
 			if (l->proved)
 				send_frame(l, CL_HANGUP, NULL, 0);
+			if (!l->ended) {
+				flush_last(l);
+				close_last(l);
+			}
 			l->ended = true;
 			close_all(l);
 		}
@@ -807,9 +946,10 @@ int cl_link_answer(struct cl_link *l, uint16_t *port, uint8_t nonce[CL_NONCE_BYT
 	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	sin.sin_port = 0;
 
+	/* A long backlog: a flood of connections can't keep Consort's from being queued */
 	if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&yes, sizeof(yes)) ||
 	    bind(s, (struct sockaddr *)&sin, sizeof(sin)) ||
-	    listen(s, 4) ||
+	    listen(s, SOMAXCONN) ||
 	    getsockname(s, (struct sockaddr *)&sin, &len)) {
 		(void)closesocket(s);
 		return EIO;

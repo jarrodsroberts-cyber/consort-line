@@ -10,11 +10,12 @@
  *
  * then commands, and the add-on's events come back (PROTOCOL.md). It takes no arguments.
  * Exit codes: 0 when Consort said quit or closed its end, 2 when the first lines weren't
- * right, 1 for anything else.
+ * right, 1 when a later line broke a rule, or for anything else.
  *
  * Copyright (C) 2026 The consort-line authors. BSD-3-Clause, see LICENSE.
  */
 #include <winsock2.h>
+#include <errno.h>
 #include <re.h>
 #include <baresip.h>
 #include <stdlib.h>
@@ -74,8 +75,10 @@ int main(void)
 	if (err)
 		return 1;
 
-	if (consort_line_open()) {
-		code = 2;
+	err = consort_line_open();
+	if (err) {
+		/* 2 when the first two lines weren't right, 1 when the line couldn't start */
+		code = err == EBADMSG ? 2 : 1;
 		goto out;
 	}
 
@@ -96,8 +99,16 @@ int main(void)
 		goto out;
 	}
 
+	/* hello is the first line on standard output: commands and calls are taken only
+	 * inside re_main. EPIPE: Consort closed its end before reading it, so 0 */
+	err = consort_line_hello();
+	if (err) {
+		code = err == EPIPE ? 0 : 1;
+		goto out;
+	}
+
 	err = re_main(NULL);
-	code = err ? 1 : 0;
+	code = err ? 1 : consort_line_code();
 
  out:
 	ua_stop_all(true);

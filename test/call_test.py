@@ -87,9 +87,11 @@ def free_port(kind: int) -> int:
 
 
 class FarEnd:
-    """The tests' far end, from a config file and an account."""
+    """The tests' far end, from a config file and an account (params: more of its account's
+    parameters, such as ";ptime=30")."""
 
-    def __init__(self, exe: str, folder: Path, sip_port: int, account: str, lines: list[str]):
+    def __init__(self, exe: str, folder: Path, sip_port: int, account: str, lines: list[str],
+                 params: str = ""):
         folder.mkdir(parents=True)
         config = folder / "config"
         config.write_text("\n".join([
@@ -104,7 +106,8 @@ class FarEnd:
             *lines]) + "\n", encoding="utf-8")
         self.log = open(folder / "stderr.txt", "wb")
         self.proc = subprocess.Popen(
-            [exe, str(config), f"<{account}>;regint=0;answermode=manual;audio_codecs=PCMU"],
+            [exe, str(config),
+             f"<{account}>;regint=0;answermode=manual;audio_codecs=PCMU{params}"],
             cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=self.log)
 
     def stop(self) -> None:
@@ -115,14 +118,18 @@ class FarEnd:
 
 
 class Line:
-    """consort-line, as Consort holds it: its standard input and output are the channel."""
+    """consort-line, as Consort holds it: its standard input and output are the channel.
+    close_after: Consort's end of standard output closes once that event has come (its
+    standard input stays open)."""
 
-    def __init__(self, exe: str, folder: Path, first: list[bytes] | None = None):
+    def __init__(self, exe: str, folder: Path, first: list[bytes] | None = None,
+                 close_after: str | None = None):
         folder.mkdir(parents=True, exist_ok=True)
         self.secret = secrets.token_bytes(32)
         self.events: queue.Queue = queue.Queue()
         self.raw: list[bytes] = []
         self.ids = 0
+        self.close_after = close_after
         self.log = open(folder / "stderr.txt", "wb")
         self.proc = subprocess.Popen([exe], cwd=folder, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=self.log)
@@ -143,6 +150,9 @@ class Line:
             except ValueError:
                 event = {"event": "not json", "line": text.decode("utf-8", "replace")}
             self.events.put(event)
+            if self.close_after and event.get("event") == self.close_after:
+                self.proc.stdout.close()     # on this thread, the only one reading it
+                break
         self.events.put({"event": "eof"})
 
     def wait(self, kinds: set[str], within: float = 10.0) -> dict:
@@ -173,6 +183,12 @@ class Line:
         self.proc.wait(10)
         self.log.close()
 
+    def exit_code(self, within: float = 15.0) -> int | None:
+        try:
+            return self.proc.wait(within)
+        except subprocess.TimeoutExpired:
+            return None
+
 
 def proof(secret: bytes, nonce: bytes, side: bytes, port: int) -> bytes:
     return hmac.new(secret, side + nonce + port.to_bytes(2, "big"), hashlib.sha256).digest()[:16]
@@ -184,17 +200,27 @@ def frame(kind: int, payload: bytes = b"") -> bytes:
 
 class Conn:
     """A call's connection, as Consort makes it: proves itself, checks the line's proof, and
-    reads every frame on a thread of its own, with the moment it came."""
+    reads every frame on a thread of its own, with the moment it came (from the start, or from
+    start_reading for a Consort that is behind). `reset`: the connection ended in a reset."""
 
-    def __init__(self, secret: bytes, answered: dict):
+    def __init__(self, secret: bytes, answered: dict, reading: bool = True):
         port, nonce = answered["port"], bytes.fromhex(answered["nonce"])
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        # As PROTOCOL.md asks: a receive buffer of 4,096 bytes, set before connecting
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        self.sock.settimeout(5)
+        self.sock.connect(("127.0.0.1", port))
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.sendall(frame(ID, proof(secret, nonce, b"consort", port)))
         back = self._exactly(19)
         self.proved = back == frame(ID, proof(secret, nonce, b"line", port))
         self.frames: queue.Queue = queue.Queue()
+        self.reset = False
         self.sock.settimeout(None)
+        if reading:
+            self.start_reading()
+
+    def start_reading(self) -> None:
         threading.Thread(target=self._read, daemon=True).start()
 
     def _exactly(self, n: int) -> bytes:
@@ -215,7 +241,7 @@ class Conn:
                 payload = self._exactly(int.from_bytes(header[1:], "big"))
                 self.frames.put((time.perf_counter(), header[0], payload))
         except OSError:
-            pass
+            self.reset = True
         self.frames.put((time.perf_counter(), None, b""))
 
     def next(self, kinds: set[int], within: float = 5.0):
@@ -272,8 +298,9 @@ def hello_of(line: Line) -> dict:
 
 # -- the tests -------------------------------------------------------------------------------
 
-def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path) -> None:
-    print("A call that rings here, answered by Consort, audio both ways, a key, a hang-up")
+def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path, ptime: int = 20) -> None:
+    print(f"A call that rings here (the caller's packets {ptime} ms), answered by Consort, "
+          "audio both ways, a key, a hang-up")
     caller_wav, heard_wav = root / "caller.wav", root / "heard.wav"
     write_wav(caller_wav, tone(4.0, 440, -20) + array.array("h", bytes(2 * RATE * 6)))
     caller_sip, ctrl_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
@@ -287,10 +314,11 @@ def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path) -> None:
         check(hello.get("sip", "").startswith("127.0.0.1:"), "SIP is on 127.0.0.1 alone")
         line_sip = int(hello["sip"].rsplit(":", 1)[1])
 
+        # Its offer asks for a=ptime:<ptime>, which the line's sender then keeps to
         caller = FarEnd(caller_exe, root / "caller", caller_sip, "sip:caller@127.0.0.1", [
             f"audio_source\t\taufile,{caller_wav}", f"audio_player\t\taufile,{heard_wav}",
             "module\t\t\taufile.so", "module_app\t\tmenu.so", "module_app\t\tctrl_tcp.so",
-            f"ctrl_tcp_listen\t\t127.0.0.1:{ctrl_port}"])
+            f"ctrl_tcp_listen\t\t127.0.0.1:{ctrl_port}"], params=f";ptime={ptime}")
         ctrl = Ctrl(ctrl_port)
         ctrl.do("dial", f"sip:line@127.0.0.1:{line_sip}")
 
@@ -382,6 +410,12 @@ def a_call_that_rings_here(line_exe: str, caller_exe: str, root: Path) -> None:
         check(False, "the caller's recording was written")
 
 
+def a_call_at_30_ms(line_exe: str, caller_exe: str, root: Path) -> None:
+    """A far end that asks for 30 ms packets still hears the line (its source takes any
+    ptime), and the line's frames to Consort stay 20 ms."""
+    a_call_that_rings_here(line_exe, caller_exe, root, ptime=30)
+
+
 def wav_data(path: Path) -> array.array:
     """A WAV's samples from its data chunk, whatever its header says of the length (a far end
     that is killed may leave the header unfinished)."""
@@ -443,7 +477,9 @@ def a_call_placed_to_an_echo(line_exe: str, caller_exe: str, root: Path) -> None
         check(reply.get("ok") is True, "Consort hangs up")
         check(line.wait({"closed"}).get("event") == "closed", "closed")
         gone = conn.next({HANGUP}, within=5.0)
-        check(bool(gone), "and the call's connection ends")
+        check(bool(gone) and gone[1] is None,
+              f"and the call's connection closes with no HANGUP: Consort hung up "
+              f"({gone and gone[1]})")
         conn.close()
     finally:
         line.stop()
@@ -504,7 +540,13 @@ def two_lines(line_exe: str, caller_exe: str, root: Path) -> None:
         check(a.send(do="hangup", call=answered_a["call"]).get("ok") is True, "A hangs up")
         check(a.wait({"closed"}).get("event") == "closed", "closed on A")
         check(b.wait({"closed"}).get("event") == "closed", "and on B, which the far end left")
-        check(bool(conn_b.next({HANGUP}, within=5.0)), "B's Consort hears HANGUP")
+        gone_b = conn_b.next({HANGUP}, within=5.0)
+        check(bool(gone_b) and gone_b[1] == HANGUP,
+              f"B's Consort hears HANGUP: its far end hung up ({gone_b and gone_b[1]})")
+        gone_a = conn_a.next({HANGUP}, within=5.0)
+        check(bool(gone_a) and gone_a[1] is None,
+              f"A's connection closes with no HANGUP: A's Consort hung up "
+              f"({gone_a and gone_a[1]})")
         conn_a.close()
         conn_b.close()
     finally:
@@ -512,13 +554,150 @@ def two_lines(line_exe: str, caller_exe: str, root: Path) -> None:
         b.stop()
 
 
+def standard_output_going(line_exe: str, caller_exe: str, root: Path) -> None:
+    print("Consort's end of standard output goes while a call is up, then the call ends")
+    silence = root / "silence.wav"
+    write_wav(silence, array.array("h", bytes(2 * RATE * 10)))
+    endings = ("Consort's HANGUP frame", "Consort's hangup command", "the far end's hang-up")
+    for n, how in enumerate(endings):
+        far_sip, ctrl_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
+        if n < 2:
+            far = FarEnd(caller_exe, root / f"echo{n}", far_sip, "sip:echo@127.0.0.1", [
+                "audio_source\t\taubridge,echo", "audio_player\t\taubridge,echo",
+                "module\t\t\taubridge.so", "module_app\t\techo.so"])
+        else:
+            far = FarEnd(caller_exe, root / f"caller{n}", far_sip, "sip:caller@127.0.0.1", [
+                f"audio_source\t\taufile,{silence}",
+                f"audio_player\t\taufile,{root / 'heard.wav'}",
+                "module\t\t\taufile.so", "module_app\t\tmenu.so", "module_app\t\tctrl_tcp.so",
+                f"ctrl_tcp_listen\t\t127.0.0.1:{ctrl_port}"])
+        line = Line(line_exe, root / f"line{n}", close_after="answered")
+        try:
+            hello = hello_of(line)
+            if n < 2:
+                time.sleep(0.5)
+                line.send(do="dial", to=f"sip:echo@127.0.0.1:{far_sip}")
+            else:
+                ctrl = Ctrl(ctrl_port)
+                ctrl.do("dial", f"sip:line@127.0.0.1:{hello['sip'].rsplit(':', 1)[1]}")
+                incoming = line.wait({"incoming"})
+                line.send(do="accept", call=incoming.get("call", ""))
+            answered = line.wait({"answered"})
+            if not check(answered.get("event") == "answered",
+                         f"{how}: the call is answered ({answered.get('event')})"):
+                continue
+            check(line.wait({"eof"}).get("event") == "eof",
+                  "  Consort's end of standard output closes; standard input stays open")
+            conn = Conn(line.secret, answered)
+            check(conn.proved, "  both ends prove themselves")
+            if n == 0:
+                conn.send(HANGUP)
+            elif n == 1:
+                line.proc.stdin.write(json.dumps(
+                    {"id": line.ids + 1, "do": "hangup", "call": answered["call"]}).encode()
+                    + b"\n")
+                line.proc.stdin.flush()
+            else:
+                ctrl.do("hangup")
+            # The closed event can't be written: the line hangs the call up once, then quits
+            code = line.exit_code()
+            check(code == 0, f"  the call is hung up once, and the line exits 0 ({code})")
+            conn.close()
+        finally:
+            line.stop()
+            far.stop()
+
+
+def a_hang_up_then_quit_with_consort_behind(line_exe: str, caller_exe: str, root: Path) -> None:
+    print("The far end hangs up while Consort is behind and speaking, and Consort quits at once")
+    silence = root / "silence.wav"
+    write_wav(silence, array.array("h", bytes(2 * RATE * 10)))
+    far_sip, ctrl_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
+    far = FarEnd(caller_exe, root / "caller", far_sip, "sip:caller@127.0.0.1", [
+        f"audio_source\t\taufile,{silence}",
+        f"audio_player\t\taufile,{root / 'heard.wav'}",
+        "module\t\t\taufile.so", "module_app\t\tmenu.so", "module_app\t\tctrl_tcp.so",
+        f"ctrl_tcp_listen\t\t127.0.0.1:{ctrl_port}"])
+    line = Line(line_exe, root / "line")
+    speaking = threading.Event()
+    conn = None
+
+    def speak() -> None:
+        while speaking.is_set():
+            try:
+                conn.send(AUDIO, bytes(2 * SAMPLES))
+            except OSError:
+                return
+            time.sleep(0.02)
+
+    try:
+        hello = hello_of(line)
+        ctrl = Ctrl(ctrl_port)
+        ctrl.do("dial", f"sip:line@127.0.0.1:{hello['sip'].rsplit(':', 1)[1]}")
+        incoming = line.wait({"incoming"})
+        line.send(do="accept", call=incoming.get("call", ""))
+        answered = line.wait({"answered"})
+        if not check(answered.get("event") == "answered",
+                     f"the call is answered ({answered.get('event')})"):
+            return
+        conn = Conn(line.secret, answered, reading=False)
+        check(conn.proved, "  both ends prove themselves")
+        speaking.set()
+        threading.Thread(target=speak, daemon=True).start()
+        time.sleep(1.2)                       # Consort reads nothing: behind by 60 frames
+        ctrl.do("hangup")
+        closed = line.wait({"closed"})
+        check(closed.get("event") == "closed", f"  the far end hangs up: closed ({closed})")
+        reply = line.send(do="quit")
+        check(reply.get("event") == "reply" and reply.get("ok") is True,
+              f"  Consort says quit at once ({reply})")
+        time.sleep(0.3)                       # still behind and speaking: the line must wait
+        check(line.proc.poll() is None,
+              "  the line still waits for this connection before it exits")
+        conn.start_reading()                  # and catches up only now
+        kinds = []
+        while True:
+            got = conn.next({AUDIO, HANGUP, ERROR}, within=5)
+            if got is None or got[1] is None:
+                break
+            kinds.append(got[1])
+        speaking.clear()
+        audio = kinds.count(AUDIO)
+        # figures' sent is counted as each tick starts: one short of the frames sent
+        sent = (closed.get("figures") or {}).get("sent", 1 << 30)
+        check(bool(kinds) and kinds[-1] == HANGUP and audio >= sent,
+              f"  every frame that waited still comes, then HANGUP ({audio} frames of "
+              f"{sent} counted, then {kinds[-1] if kinds else None})")
+        check(got is not None and not conn.reset,
+              f"  then the end, not a reset (ended: {got is not None}, reset: {conn.reset})")
+        conn.close()
+        code = line.exit_code(within=1.0)
+        check(code == 0, f"  and the line exits 0 once Consort closes its end ({code})")
+    finally:
+        speaking.clear()
+        if conn is not None:
+            conn.close()
+        line.stop()
+        far.stop()
+
+
 def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
     print("The control channel")
     secret_line = json.dumps({"line": 1, "secret": "11" * 32}).encode()
+    settings = json.dumps(SETTINGS).encode()
     cases = [
         ("a secret that isn't 32 bytes", [b'{"line": 1, "secret": "00"}', b"{}"], "secret"),
         ("a secret line with more in it",
          [json.dumps({"line": 1, "secret": "11" * 32, "x": 1}).encode()], "secret"),
+        ("a secret line with more after it", [secret_line + b' {"x": 1}', settings], "secret"),
+        ("a secret line with a key twice",
+         [b'{"line": 1, "secret": "' + b"11" * 32 + b'", "secret": "' + b"22" * 32 + b'"}',
+          settings], "secret"),
+        ("a secret line with a NUL in it", [secret_line + b"\x00 junk", settings], "secret"),
+        ("a secret with a \\u0000 in it",
+         [b'{"line": 1, "secret": "' + b"11" * 32 + b'\\u0000"}', settings], "secret"),
+        ("a secret line with a key and no value",
+         [b'{"line": 1, "secret": "' + b"11" * 32 + b'", "secret":}', settings], "secret"),
         ("settings that listen beyond 127.0.0.1",
          [secret_line, json.dumps({**SETTINGS, "listen": "0.0.0.0:5060"}).encode()], "settings"),
         ("an account that isn't on 127.0.0.1",
@@ -526,6 +705,7 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
          "settings"),
         ("settings with more in them",
          [secret_line, json.dumps({**SETTINGS, "module": "ctrl_tcp"}).encode()], "settings"),
+        ("settings with more after them", [secret_line, settings + b" x"], "settings"),
     ]
     for n, (what, first, why) in enumerate(cases):
         line = Line(line_exe, root / f"first{n}", first=first)
@@ -533,27 +713,105 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
             failed = line.wait({"failed"})
             check(failed.get("event") == "failed" and failed.get("why") == why,
                   f"{what}: failed ({failed.get('why')})")
-            try:
-                code = line.proc.wait(15)
-            except subprocess.TimeoutExpired:
-                code = None
+            code = line.exit_code()
             check(code == 2, f"  and it exits 2 ({code})")
         finally:
             line.stop()
 
-    line = Line(line_exe, root / "badcmd")
+    # Both first lines are due 10 s from the start, not 10 s each
+    line = Line(line_exe, root / "late", first=[])
+    try:
+        time.sleep(6)
+        line.proc.stdin.write(secret_line + b"\n")
+        line.proc.stdin.flush()
+        time.sleep(6)                       # 12 s from the start, 6 s after the secret
+        try:
+            line.proc.stdin.write(settings + b"\n")
+            line.proc.stdin.flush()
+        except OSError:
+            pass                            # it has gone already, as it should
+        got = line.wait({"hello"})
+        check(got.get("event") == "failed" and got.get("why") == "settings",
+              f"settings 12 s after the start: failed ({got})")
+        code = line.exit_code()
+        check(code == 2, f"  and it exits 2 ({code})")
+    finally:
+        line.stop()
+
+    # A line after the first two that breaks a rule: failed, and it exits 1
+    broken = [
+        ("a command with a key it doesn't take",
+         b'{"id": 1, "do": "dial", "to": "sip:x@127.0.0.1", "via": "y"}'),
+        ("a command with a key twice",
+         b'{"id": 1, "do": "hangup", "call": "0123456789abcdef", "call": "fedcba9876543210"}'),
+        ("two commands on one line",
+         b'{"id": 1, "do": "hangup", "call": "0123456789abcdef"} {"id": 2, "do": "quit"}'),
+        ("a command with a NUL in it", b'{"id": 1, "do": "quit"}\x00 junk'),
+        ("a command with a \\u0000 in it", b'{"id": 1, "do": "quit\\u0000x"}'),
+        ("a command with a key and no value", b'{"id": 1, "do": "quit", "do":}'),
+        ("a command with a name alone", b'{"id": 1, "do": "quit", "x"}'),
+        ("a command with a trailing comma", b'{"id": 1, "do": "quit",}'),
+        ("a key with a lone surrogate", b'{"id": 1, "do\\udc00": "quit"}'),
+        ("an id past 2^53 - 1", b'{"id": 9007199254740992, "do": "quit"}'),
+        ("a dial whose to isn't a string", b'{"id": 1, "do": "dial", "to": null}'),
+        ("a line past 4,096 bytes", b"x" * 5000),
+    ]
+    for n, (what, data) in enumerate(broken):
+        line = Line(line_exe, root / f"broken{n}")
+        try:
+            hello_of(line)
+            line.proc.stdin.write(data + b"\n")
+            line.proc.stdin.flush()
+            got = line.wait({"failed", "reply"})
+            check(got.get("event") == "failed", f"{what}: failed ({got})")
+            code = line.exit_code()
+            check(code == 1, f"  and it exits 1 ({code})")
+        finally:
+            line.stop()
+
+    # hello is the first line even when a command comes with the first two
+    line = Line(line_exe, root / "eager",
+                first=[secret_line, settings, b'{"id": 1, "do": "quit"}'])
+    try:
+        end = line.wait(set(), within=15)
+        check(end.get("event") == "eof", f"a quit sent with the first lines: it quits ({end})")
+        check(len(line.raw) == 2 and line.raw[0].startswith(b'{"event":"hello"')
+              and line.raw[1].startswith(b'{"event":"reply","id":1,"ok":true'),
+              f"  hello first, then the quit's reply ({line.raw})")
+        code = line.exit_code()
+        check(code == 0, f"  and it exits 0 ({code})")
+    finally:
+        line.stop()
+
+    # An address the line doesn't take is a reply, not a broken line: no URI parameters, and no
+    # URI headers (baresip would send ?Replaces= as a Replaces header)
+    line = Line(line_exe, root / "addresses")
     try:
         hello_of(line)
-        line.proc.stdin.write(b'{"id": 1, "do": "dial", "to": "sip:x@127.0.0.1", "via": "y"}\n')
-        line.proc.stdin.flush()
-        failed = line.wait({"failed"})
-        check(failed.get("event") == "failed",
-              f"a command with a key it doesn't take: failed ({failed})")
-        try:
-            code = line.proc.wait(15)
-        except subprocess.TimeoutExpired:
-            code = None
-        check(code is not None, "and it exits")
+        for to in ("sip:x@127.0.0.1;transport=udp", "sip:x@127.0.0.1?Replaces=abc",
+                   "sip:x y@127.0.0.1", "tel:+15550100"):
+            reply = line.send(do="dial", to=to)
+            check(reply.get("event") == "reply" and reply.get("ok") is False
+                  and reply.get("why") == "an address the line doesn't take",
+                  f"a dial to {to}: refused in its reply ({reply})")
+        line.ids = 9007199254740990       # the next command's id is the largest one taken
+        reply = line.send(do="quit")
+        check(reply.get("event") == "reply" and reply.get("ok") is True
+              and reply.get("id") == 9007199254740991,
+              f"  the line goes on, and the id 2^53 - 1 comes back exact ({reply})")
+        code = line.exit_code()
+        check(code == 0, f"  and it exits 0 ({code})")
+    finally:
+        line.stop()
+
+    line = Line(line_exe, root / "quit")
+    try:
+        hello_of(line)
+        reply = line.send(do="quit")
+        check(reply.get("event") == "reply" and reply.get("ok") is True,
+              f"Consort says quit: it replies ({reply})")
+        code = line.exit_code()
+        check(code == 0, f"  and it exits 0 ({code})")
     finally:
         line.stop()
 
@@ -561,13 +819,35 @@ def the_control_channel(line_exe: str, caller_exe: str, root: Path) -> None:
     try:
         hello_of(line)
         line.proc.stdin.close()
-        try:
-            code = line.proc.wait(15)
-        except subprocess.TimeoutExpired:
-            code = None
-        check(code == 0, f"Consort's end closing: it exits ({code})")
+        code = line.exit_code()
+        check(code == 0, f"Consort's end closing: it exits 0 ({code})")
     finally:
         line.stop()
+
+    # Consort's end of standard output closed before hello: hello can't be written, and
+    # that is Consort closing its end, so 0
+    folder = root / "no-output"
+    folder.mkdir()
+    with open(folder / "stderr.txt", "wb") as log:
+        proc = subprocess.Popen([line_exe], cwd=folder, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=log)
+        try:
+            proc.stdout.close()
+            proc.stdin.write(secret_line + b"\n" + settings + b"\n")
+            proc.stdin.flush()
+            code = proc.wait(15)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            code = repr(error)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+    check(code == 0,
+          f"Consort's end of standard output closed before hello: it exits 0 ({code})")
 
 
 def main(argv: list[str]) -> int:
@@ -577,7 +857,8 @@ def main(argv: list[str]) -> int:
     line_exe, caller_exe = (str(Path(p).resolve()) for p in argv)
     with tempfile.TemporaryDirectory(prefix="consort-line-") as made:
         root = Path(made)
-        for test in (a_call_that_rings_here, a_call_placed_to_an_echo, two_lines,
+        for test in (a_call_that_rings_here, a_call_at_30_ms, a_call_placed_to_an_echo,
+                     two_lines, standard_output_going, a_hang_up_then_quit_with_consort_behind,
                      the_control_channel):
             folder = root / test.__name__
             folder.mkdir()
