@@ -940,10 +940,6 @@ static void test_a_flood_of_connections_stops_neither_the_tick_nor_the_link(void
 }
 
 
-/* The frames the two sockets held for a Consort that read nothing, from the test below for the
- * one after it: Windows' share, which differs between its versions */
-static unsigned kernel_frames;
-
 static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_fill(void)
 {
 	struct call c;
@@ -967,27 +963,27 @@ static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_f
 	consort_id(want, c.nonce, c.port, "line");
 	CHECK(memcmp(back, want, sizeof(want)) == 0);
 
-	/* Nothing is read from here: the 2 s count once both sockets are full */
+	/* Nothing is read from here: the 2 s count once both sockets are full. With Windows' own
+	 * buffer sizes they would take every frame for longer than this waits */
 	start = GetTickCount();
-	ended = WaitForSingleObject(c.ending.ev, 6000) == WAIT_OBJECT_0;
+	ended = WaitForSingleObject(c.ending.ev, 12000) == WAIT_OBJECT_0;
 	spent = GetTickCount() - start;
 	CHECK(ended && c.ending.why == CL_END_NOT_TAKEN);
 
-	/* What the two sockets held, and no more: the line's own queue went with the call.
-	 * Windows 11 holds about 26 frames there and Windows Server about 65; with Windows' own
-	 * buffer sizes the sockets take every frame of 3 s and more */
+	/* What the two sockets held. Windows 11 holds 26 frames there; Windows Server's share
+	 * grows over a call (7 to 97 measured), so the test reads it rather than assume it */
 	if (ended) {
 		while (read_frame(s, &type, payload, &len) == 1) {
 			if (type == CL_AUDIO)
 				++audio;
 		}
-		CHECK(audio <= 100);
 	}
 
-	/* A frame each 20 ms filled the sockets, and the 2 s count from then: never sooner, and
-	 * never from later */
-	CHECK(spent >= 2000 && spent <= 2000 + 20 * audio + 500);
-	kernel_frames = audio;
+	/* A frame each 20 ms, and the call ended 2 s after the last one the sockets took: never
+	 * sooner, never from later, and none of the line's own queue came after them (that would
+	 * be a frame for every 20 ms of the wait) */
+	CHECK(spent + 500 >= 2000 + 20 * audio);
+	CHECK(spent <= 2000 + 20 * audio + 1000);
 	printf("  frames not taken: the call ended after %lu ms, with %u frames left to read\n",
 	       (unsigned long)spent, audio);
 
@@ -999,10 +995,10 @@ static void test_frames_not_taken_hang_the_call_up_2_seconds_after_the_sockets_f
 /**
  * The call ends while Consort is behind in reading: the far end hangs up, or Consort breaks a
  * rule. Every frame that waited for Consort still comes, in order, then HANGUP or ERROR 2,
- * then the close. Consort reads nothing (a 4 KB receive buffer) until the line's own queue
- * holds about 30 frames past what the two sockets take (kernel_frames, from the test before),
- * well inside the 2 s the line gives it once they are full. The stand-in player numbers its
- * frames 1, 2, 3, so a frame missing shows.
+ * then the close. Consort reads nothing for 1.5 s (a 4 KB receive buffer), past what the two
+ * sockets take on Windows 11 (26 frames) and inside the 2 s the line gives Consort once they
+ * are full, however soon that is. The stand-in player numbers its frames 1, 2, 3, so a frame
+ * missing shows.
  */
 static void ends_while_consort_is_behind(bool far_end)
 {
@@ -1026,7 +1022,7 @@ static void ends_while_consort_is_behind(bool far_end)
 	consort_id(want, c.nonce, c.port, "line");
 	CHECK(memcmp(back, want, sizeof(want)) == 0);
 
-	Sleep(20 * kernel_frames + 600);
+	Sleep(1500);
 	if (far_end)
 		cl_link_hangup(c.link);
 	else
@@ -1053,11 +1049,10 @@ static void ends_while_consort_is_behind(bool far_end)
 	CHECK(r == 0);                        /* the line closed: not a timeout */
 	CHECK(last == (far_end ? CL_HANGUP : CL_ERROR));
 	CHECK(far_end || code == CL_ERR_FRAME);
-	CHECK(gaps == 0);
-	CHECK(audio >= kernel_frames + 20);   /* about 30 past what the sockets held */
+	CHECK(gaps == 0 && audio >= 50);      /* about 75: 1.5 s of frames */
 	CHECK(prev == pulled);                /* the last frame the line pulled came too */
-	printf("  %s with Consort behind: %u frames (the sockets hold %u), then 0x%02x and "
-	       "the close\n", how, audio, kernel_frames, last);
+	printf("  %s with Consort behind: %u frames, then 0x%02x and the close\n",
+	       how, audio, last);
 
 	closesocket(s);
 	call_end(&c);

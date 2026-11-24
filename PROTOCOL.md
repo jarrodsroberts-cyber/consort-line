@@ -138,8 +138,8 @@ consort-line's frames for 2 seconds also hangs the call up. The 2 seconds count 
 connection holds no more frames: consort-line sets its own send buffer to 2,048 bytes, and
 the agent's program sets its socket's receive buffer to 4,096 bytes (`SO_RCVBUF`, before it
 connects). The connection then holds about half a second of frames on Windows 11 (26
-measured) and about 1.3 seconds on Windows Server (65), against every frame of 3 seconds and
-more with Windows' own buffer sizes.
+measured, steady over a call), against every frame of 3 seconds and more with Windows' own
+buffer sizes. Windows Server 2022 lets its share grow over a call (7 to 97 frames measured).
 
 ## What it guards against, and what it doesn't
 

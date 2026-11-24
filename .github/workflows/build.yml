@@ -38,11 +38,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Probe loopback buffers (temporary)
-        shell: bash
-        continue-on-error: true
-        run: python -I test/probe_buffers.py
-
       - name: Fetch re and baresip at their pinned commits
         shell: bash
         run: |

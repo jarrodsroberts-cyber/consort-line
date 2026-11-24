@@ -158,8 +158,9 @@ static bool flush_out(struct cl_link *l)
 /**
  * The last of the line's frames (HANGUP or ERROR, after what waited for Consort): the
  * kernel is given room for all of it, as the small send buffer could leave it in the
- * line's own queue, which goes when the connection closes. The close is graceful, so the
- * kernel still sends what it holds, then the end.
+ * line's own queue, which goes when the connection closes. The room is generous: Windows
+ * Server's share moves over a call, and a raise to just the queue's size left frames behind
+ * there. The close is graceful, so the kernel still sends what it holds, then the end.
  */
 static void flush_last(struct cl_link *l)
 {
